@@ -1,9 +1,14 @@
 import os
 import sys
 import json
+import logging
+import threading
+import traceback
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, File
+from aiogram.types import Message
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -11,10 +16,12 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from groq import Groq
 
-# Загружаем переменные окружения
+# Настройка логирования для вывода всех ошибок в Render Logs
+logging.basicConfig(level=logging.INFO)
+
+# Загрузка переменных окружения
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -23,7 +30,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not BOT_TOKEN:
-    print("ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
+    logging.error("ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
     sys.exit(1)
 
 # Инициализация клиентов
@@ -53,7 +60,8 @@ async def cmd_start(message: Message, state: FSMContext):
             "С возвращением!\n"
             "• Отправляй текст или голосовые (например, «капучино 250» или «зарплата 50000»).\n"
             "• /profile — твой баланс и бюджет.\n"
-            "• /stats — сводка расходов."
+            "• /stats — сводка расходов.\n"
+            "• /audit — советы от AI."
         )
 
 @dp.message(ProfileSetup.waiting_for_balance)
@@ -72,11 +80,17 @@ async def process_budget(message: Message, state: FSMContext):
     try:
         budget = float(message.text.replace(",", "."))
         user_id = message.from_user.id
+        
+        # Записываем budget
         supabase.table("users").update({"monthly_budget": budget}).eq("telegram_id", user_id).execute()
         
+        # Получаем сохраненный ранее баланс
+        user_res = supabase.table("users").select("balance").eq("telegram_id", user_id).execute()
+        balance = user_res.data[0].get("balance", 0.0) if user_res.data else 0.0
+        
         await message.answer(
-            f" Настройка завершена!\n\n"
-            f"• Доступно: {budget:.2f} ₽\n"
+            f"🎉 Настройка завершена!\n\n"
+            f"• Доступно: {balance:.2f} ₽\n"
             f"• План на месяц: {budget:.2f} ₽\n\n"
             f"Просто пиши или наговаривай свои расходы и доходы!"
         )
@@ -91,32 +105,30 @@ async def cmd_profile(message: Message):
     
     if response.data:
         user = response.data[0]
+        balance = user.get('balance') or 0.0
+        budget = user.get('monthly_budget') or 0.0
         await message.answer(
             f"📊 **Твой финансовый профиль:**\n\n"
-            f"💰 Доступно средств: **{user['balance']} ₽**\n"
-            f"🎯 План расходов на месяц: **{user['monthly_budget']} ₽**"
+            f"💰 Доступно средств: **{balance:.2f} ₽**\n"
+            f"🎯 План расходов на месяц: **{budget:.2f} ₽**"
         )
     else:
         await message.answer("Профиль не найден. Напиши /start для регистрации.")
 
-# Функция парсинга текста через Groq AI
+# Универсальная функция парсинга через AI
 def parse_financial_text(text: str) -> dict:
     prompt = f"""
-    Проанализируй текст финансовой транзакции и верни JSON ответа без лишнего текста:
+    Ты — универсальный парсер финансовых транзакций. Проанализируй текст и выдели сумму, тип и категорию.
+    
     Текст: "{text}"
     
-    Верни строго JSON со следующими полями:
-    - "amount": число (сумма)
-    - "type": "expense" (если расход/покупка) или "income" (если доход/зарплата/перевод мне)
-    - "category": стандартизированная категория с большой буквы (например: "Кофе", "Продукты", "Такси", "Зарплата", "Развлечения", "Рестораны", "Здоровье")
+    Правила:
+    1. "amount": число (сумма). Если не указана, верни 0.
+    2. "type": "expense" (расход/покупка/оплата) или "income" (доход/зарплата/перевод мне).
+    3. "category": подбери подходящую категорию с большой буквы на русском (например: "Такси", "Продукты", "Жилье", "Кофе", "Развлечения").
     
-    Примеры унификации:
-    - "капучино", "кофий", "латте" -> category: "Кофе"
-    - "таксичка", "яндекс го" -> category: "Такси"
-    - "пятерочка", "еда" -> category: "Продукты"
-    
-    JSON формат:
-    {{"amount": 250, "type": "expense", "category": "Кофе"}}
+    Верни СТРОГО valid JSON без лишних символов:
+    {{"amount": 350, "type": "expense", "category": "Такси"}}
     """
     
     response = groq_client.chat.completions.create(
@@ -127,9 +139,9 @@ def parse_financial_text(text: str) -> dict:
     
     return json.loads(response.choices[0].message.content)
 
-# Вспомогательная функция сохранения транзакции
+# Сохранение транзакции с защитой от пустых балансов
 async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, message: Message):
-    amount = parsed_data.get("amount", 0)
+    amount = float(parsed_data.get("amount", 0))
     tx_type = parsed_data.get("type", "expense")
     category = parsed_data.get("category", "Другое")
     
@@ -137,7 +149,7 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
         await message.answer("Не удалось распознать сумму. Попробуй еще раз, например: «Кофе 250»")
         return
 
-    # Записываем транзакцию в БД
+    # Запись транзакции
     supabase.table("transactions").insert({
         "telegram_id": user_id,
         "amount": amount,
@@ -146,10 +158,12 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
         "raw_text": raw_text
     }).execute()
 
-    # Обновляем баланс пользователя
+    # Обновление баланса
     user_res = supabase.table("users").select("balance").eq("telegram_id", user_id).execute()
     if user_res.data:
-        current_balance = float(user_res.data[0]["balance"])
+        raw_bal = user_res.data[0].get("balance")
+        current_balance = float(raw_bal) if raw_bal is not None else 0.0
+        
         new_balance = current_balance + amount if tx_type == "income" else current_balance - amount
         supabase.table("users").update({"balance": new_balance}).eq("telegram_id", user_id).execute()
         
@@ -159,17 +173,16 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
             f"Текущий баланс: **{new_balance:.2f} ₽**"
         )
 
-# Обработка текстовых сообщений о расходах/доходах
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text_transaction(message: Message):
     try:
         parsed = parse_financial_text(message.text)
         await save_transaction(message.from_user.id, parsed, message.text, message)
     except Exception as e:
-        print(f"Ошибка AI: {e}")
+        logging.error(f" Ошибка обработки текста: {e}")
+        traceback.print_exc()
         await message.answer("Не смог распознать запись. Напиши понятнее, например: «Такси 350»")
 
-# Обработка голосовых сообщений
 @dp.message(F.voice)
 async def handle_voice_transaction(message: Message):
     file_id = message.voice.file_id
@@ -180,7 +193,6 @@ async def handle_voice_transaction(message: Message):
     await bot.download_file(file_path, local_voice_path)
     
     try:
-        # Расшифровка голоса через Whisper в Groq
         with open(local_voice_path, "rb") as file_obj:
             transcription = groq_client.audio.transcriptions.create(
                 file=(local_voice_path, file_obj.read()),
@@ -194,17 +206,16 @@ async def handle_voice_transaction(message: Message):
         parsed = parse_financial_text(text)
         await save_transaction(message.from_user.id, parsed, text, message)
     except Exception as e:
-        print(f"Ошибка распознавания голоса: {e}")
+        logging.error(f" Ошибка голоса: {e}")
+        traceback.print_exc()
         await message.answer("Не удалось обработать голосовое сообщение.")
     finally:
         if os.path.exists(local_voice_path):
             os.remove(local_voice_path)
-# Команда /stats — Вывод текущих расходов и доходов
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     user_id = message.from_user.id
-    
-    # Получаем все транзакции пользователя
     res = supabase.table("transactions").select("*").eq("telegram_id", user_id).execute()
     transactions = res.data
     
@@ -212,10 +223,9 @@ async def cmd_stats(message: Message):
         await message.answer("У тебя пока нет записанных транзакций. Напиши, например: «Кофе 250»")
         return
 
-    total_expense = sum(t["amount"] for t in transactions if t["type"] == "expense")
-    total_income = sum(t["amount"] for t in transactions if t["type"] == "income")
+    total_expense = sum(float(t["amount"]) for t in transactions if t["type"] == "expense")
+    total_income = sum(float(t["amount"]) for t in transactions if t["type"] == "income")
     
-    # Группировка расходов по категориям
     categories = {}
     for t in transactions:
         if t["type"] == "expense":
@@ -231,12 +241,9 @@ async def cmd_stats(message: Message):
         f"**Расходы по категориям:**\n{cat_text if cat_text else 'Нет расходов'}"
     )
 
-# Команда /audit — AI-аудит и финансовые советы
 @dp.message(Command("audit"))
 async def cmd_audit(message: Message):
     user_id = message.from_user.id
-    
-    # Запрашиваем историю транзакций и профиль
     user_res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
     tx_res = supabase.table("transactions").select("*").eq("telegram_id", user_id).limit(30).execute()
     
@@ -250,7 +257,7 @@ async def cmd_audit(message: Message):
     history_summary = "\n".join([f"- {t['type']}: {t['amount']} ₽ ({t['category']})" for t in tx_res.data])
     
     prompt = f"""
-    Ты — опытный финансовый советник. Проанализируй финансовый профиль пользователя и историю его транзакций.
+    Ты — опытный финансовый советник. Проанализируй профиль пользователя и историю его транзакций.
     
     Месячный бюджет: {user_data.get('monthly_budget', 0)} ₽
     Текущий баланс: {user_data.get('balance', 0)} ₽
@@ -258,10 +265,7 @@ async def cmd_audit(message: Message):
     История последних операций:
     {history_summary}
     
-    Сделай краткий финансовый аудит (до 150 слов) на русском языке:
-    1. Оцени текущий ритм трат (Burn rate).
-    2. Укажи на «слепые зоны» (где переплаты, например, слишком частое кофе или такси).
-    3. Дай 3 конкретных, дружелюбных совета по оптимизации.
+    Сделай краткий финансовый аудит (до 150 слов) на русском языке с советами.
     """
 
     try:
@@ -272,11 +276,8 @@ async def cmd_audit(message: Message):
         audit_text = response.choices[0].message.content
         await message.answer(f"💡 **AI-Аудит твоего бюджета:**\n\n{audit_text}")
     except Exception as e:
-        print(f"Ошибка аудита: {e}")
+        logging.error(f"Ошибка аудита: {e}")
         await message.answer("Не удалось сгенерировать аудит. Попробуй позже.")
-
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -290,10 +291,8 @@ def run_dummy_server():
     server.serve_forever()
 
 async def main():
-    # Запускаем фейковый HTTP-сервер для прохождения проверки портов Render
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    
-    print("Бот с AI-распознаванием запущен!")
+    logging.info("Бот с AI-распознаванием запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
