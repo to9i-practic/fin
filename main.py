@@ -40,7 +40,29 @@ dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Резервный парсер на случай сбоя API
+# Точная рабочая модель из логов вашего аккаунта
+WORKING_MODEL = "groq/compound"
+
+# Нормализатор категорий (объединяет синонимы)
+def normalize_category(raw_category: str) -> str:
+    cat = str(raw_category).lower().strip()
+    
+    food_words = ["обед", "еда", "продукты", "ужин", "завтрак", "кафе", "ресторан", "перекус"]
+    transport_words = ["такси", "автобус", "метро", "бензин", "транспорт", "убер", "яндекс"]
+    house_words = ["жкх", "квартира", "аренда", "коммуналка", "жилье"]
+    
+    if any(w in cat for w in food_words):
+        return "Еда"
+    if any(w in cat for w in transport_words):
+        return "Транспорт"
+    if any(w in cat for w in house_words):
+        return "Жилье"
+    if "кофе" in cat or "капучино" in cat or "латте" in cat:
+        return "Кофе"
+        
+    return raw_category.capitalize()
+
+# Резервный парсер
 def fallback_parse(text: str) -> dict:
     text_lower = text.lower().strip()
     numbers = re.findall(r'\d+(?:[\.,]\d+)?', text_lower)
@@ -52,9 +74,9 @@ def fallback_parse(text: str) -> dict:
     tx_type = "income" if any(word in text_lower for word in income_keywords) else "expense"
     
     clean_text = re.sub(r'\d+(?:[\.,]\d+)?', '', text_lower).strip()
-    category = clean_text.capitalize() if clean_text else "Другое"
+    raw_cat = clean_text if clean_text else "Другое"
     
-    return {"amount": amount, "type": tx_type, "category": category}
+    return {"amount": amount, "type": tx_type, "category": normalize_category(raw_cat)}
 
 class ProfileSetup(StatesGroup):
     waiting_for_balance = State()
@@ -75,7 +97,7 @@ async def cmd_start(message: Message, state: FSMContext):
     else:
         await message.answer(
             "С возвращением!\n"
-            "• Отправляй текст или голосовые (например, «капучино 250» или «зарплата 50000»).\n"
+            "• Отправляй текст или голосовые (например, «обед 250» или «зарплата 50000»).\n"
             "• /profile — твой баланс и бюджет.\n"
             "• /stats — сводка расходов.\n"
             "• /audit — советы от AI.\n"
@@ -142,31 +164,31 @@ async def cmd_profile(message: Message):
     else:
         await message.answer("Профиль не найден. Напиши /start для регистрации.")
 
-# Функция парсинга через AI Groq (с подстраховкой)
+# Парсер с работающей моделью
 def parse_financial_text(text: str) -> dict:
     prompt = f"""
-    Ты — универсальный парсер финансовых транзакций. Проанализируй текст и выдели сумму, тип и категорию.
+    Ты — финансовый классификатор. Разбери текст: "{text}"
     
-    Текст: "{text}"
+    Категории: Еда (обед, ужин, еда, продукты), Кофе, Транспорт, Жилье, Развлечения, Доход, Другое.
     
-    Правила:
-    1. "amount": число (любые цифры в тексте, например "Кофе100" -> 100). Если цифр нет, верни 0.
-    2. "type": "expense" (расход/покупка/оплата) или "income" (доход/зарплата/перевод мне).
-    3. "category": название категории с большой буквы на русском (например: "Такси", "Продукты", "Жилье", "Кофе", "Развлечения").
-    
-    Верни СТРОГО valid JSON:
-    {{"amount": 100, "type": "expense", "category": "Кофе"}}
+    Верни строго чистый JSON без разметки:
+    {{"amount": 100, "type": "expense", "category": "Еда"}}
     """
     
     try:
         response = groq_client.chat.completions.create(
-            model="llama3-8b-8192",  # Используем официально поддерживаемую модель Groq
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
+            model=WORKING_MODEL,
+            messages=[{"role": "user", "content": prompt}]
         )
-        return json.loads(response.choices[0].message.content)
+        raw = response.choices[0].message.content.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].replace("json", "").strip()
+        
+        data = json.loads(raw)
+        data["category"] = normalize_category(data.get("category", "Другое"))
+        return data
     except Exception as e:
-        logging.warning(f"⚠️ Groq API недоступен ({e}), переключаемся на резервный парсер.")
+        logging.warning(f"⚠️ Ошибка Groq API ({e}), переходим на резервный парсер.")
         return fallback_parse(text)
 
 # Сохранение транзакции
@@ -174,7 +196,7 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
     try:
         amount = round(float(parsed_data.get("amount", 0)), 2)
         tx_type = str(parsed_data.get("type", "expense"))
-        category = str(parsed_data.get("category", "Другое"))
+        category = normalize_category(parsed_data.get("category", "Другое"))
         
         if amount <= 0:
             await message.answer("Не удалось распознать сумму. Попробуй еще раз, например: «Кофе 250»")
@@ -206,9 +228,8 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
     except Exception as e:
         logging.error(f"❌ Ошибка в save_transaction: {e}")
         traceback.print_exc()
-        await message.answer("Ошибка сохранения данных. Напиши /start и попробуй снова.")
+        await message.answer("Ошибка сохранения данных.")
 
-# Обработка текстовых сообщений
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text_transaction(message: Message):
     try:
@@ -217,9 +238,8 @@ async def handle_text_transaction(message: Message):
     except Exception as e:
         logging.error(f"❌ Ошибка обработки текста: {e}")
         traceback.print_exc()
-        await message.answer("Не смог распознать запись. Напиши понятнее, например: «Такси 350»")
+        await message.answer("Не смог распознать запись.")
 
-# Обработка голосовых сообщений через Whisper AI
 @dp.message(F.voice)
 async def handle_voice_transaction(message: Message):
     file_id = message.voice.file_id
@@ -257,7 +277,7 @@ async def cmd_stats(message: Message):
     transactions = res.data
     
     if not transactions:
-        await message.answer("У тебя пока нет записанных транзакций. Напиши, например: «Кофе 250»")
+        await message.answer("У тебя пока нет записанных транзакций.")
         return
 
     total_expense = sum(float(t["amount"]) for t in transactions if t["type"] == "expense")
@@ -266,7 +286,7 @@ async def cmd_stats(message: Message):
     categories = {}
     for t in transactions:
         if t["type"] == "expense":
-            cat = t["category"]
+            cat = normalize_category(t["category"])
             categories[cat] = categories.get(cat, 0) + float(t["amount"])
             
     cat_text = "\n".join([f"• {cat}: **{amt:.2f} ₽**" for cat, amt in categories.items()])
@@ -285,7 +305,7 @@ async def cmd_audit(message: Message):
     tx_res = supabase.table("transactions").select("*").eq("telegram_id", user_id).limit(30).execute()
     
     if not tx_res.data:
-        await message.answer("Недостаточно данных для анализа. Добавь хотя бы 3–5 расходов!")
+        await message.answer("Недостаточно данных для анализа.")
         return
 
     await message.answer("🧠 Анализирую твои финансы и готовлю аудит...")
@@ -294,20 +314,19 @@ async def cmd_audit(message: Message):
     history_summary = "\n".join([f"- {t['type']}: {t['amount']} ₽ ({t['category']})" for t in tx_res.data])
     
     prompt = f"""
-    Ты — опытный финансовый советник. Проанализируй профиль пользователя и историю его транзакций.
-    
+    Ты — финансовый советник.
     Месячный бюджет: {user_data.get('monthly_budget', 0)} ₽
     Текущий баланс: {user_data.get('balance', 0)} ₽
     
-    История последних операций:
+    История операций:
     {history_summary}
     
-    Сделай краткий финансовый аудит (до 150 слов) на русском языке с рекомендациями.
+    Сделай краткий финансовый аудит с 2-3 советами на русском языке.
     """
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
+            model=WORKING_MODEL,
             messages=[{"role": "user", "content": prompt}]
         )
         audit_text = response.choices[0].message.content
@@ -328,17 +347,6 @@ def run_dummy_server():
     server.serve_forever()
 
 async def main():
-    # 1. Автоматически проверяем и выводим в логи доступные модели Groq
-    try:
-        models = groq_client.models.list()
-        available_ids = [m.id for m in models.data]
-        logging.info("=" * 50)
-        logging.info(f"✅ ДОСТУПНЫЕ МОДЕЛИ GROQ ДЛЯ ВАШЕГО КЛЮЧА:\n{available_ids}")
-        logging.info("=" * 50)
-    except Exception as e:
-        logging.error(f"❌ Ошибка получения списка моделей Groq: {e}")
-
-    # 2. Запускаем заглушку порта и Telegram-бота
     threading.Thread(target=run_dummy_server, daemon=True).start()
     logging.info("Бот с AI-распознаванием запущен!")
     await dp.start_polling(bot)
