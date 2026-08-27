@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import traceback
+import re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -16,7 +17,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from groq import Groq
 
-# Настройка логирования для вывода всех ошибок в консоль Render
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 # Загрузка переменных окружения
@@ -38,6 +39,22 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Резервный парсер на случай сбоя API
+def fallback_parse(text: str) -> dict:
+    text_lower = text.lower().strip()
+    numbers = re.findall(r'\d+(?:[\.,]\d+)?', text_lower)
+    if not numbers:
+        return {"amount": 0, "type": "expense", "category": "Другое"}
+    
+    amount = float(numbers[0].replace(",", "."))
+    income_keywords = ["зарплата", "аванс", "перевод", "доход", "подарили", "кешбэк", "пришло"]
+    tx_type = "income" if any(word in text_lower for word in income_keywords) else "expense"
+    
+    clean_text = re.sub(r'\d+(?:[\.,]\d+)?', '', text_lower).strip()
+    category = clean_text.capitalize() if clean_text else "Другое"
+    
+    return {"amount": amount, "type": tx_type, "category": category}
 
 class ProfileSetup(StatesGroup):
     waiting_for_balance = State()
@@ -62,7 +79,7 @@ async def cmd_start(message: Message, state: FSMContext):
             "• /profile — твой баланс и бюджет.\n"
             "• /stats — сводка расходов.\n"
             "• /audit — советы от AI.\n"
-            "• /reset — сбросить профиль и запустить настройку заново."
+            "• /reset — сбросить профиль."
         )
 
 @dp.message(Command("reset"))
@@ -73,8 +90,8 @@ async def cmd_reset(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("🔄 Профиль сброшен. Напиши /start для повторной настройки!")
     except Exception as e:
-        logging.error(f"Ошибка при сбросе профиля: {e}")
-        await message.answer("Не удалось сбросить профиль. Попробуй позже.")
+        logging.error(f"Ошибка сброса: {e}")
+        await message.answer("Не удалось сбросить профиль.")
 
 @dp.message(ProfileSetup.waiting_for_balance)
 async def process_balance(message: Message, state: FSMContext):
@@ -85,18 +102,15 @@ async def process_balance(message: Message, state: FSMContext):
         await message.answer("Отлично! Теперь укажи твой **план расходов на месяц** (бюджет):")
         await state.set_state(ProfileSetup.waiting_for_budget)
     except ValueError:
-        await message.answer("Пожалуйста, введи число (например, 50000).")
+        await message.answer("Пожалуйста, введи число.")
 
 @dp.message(ProfileSetup.waiting_for_budget)
 async def process_budget(message: Message, state: FSMContext):
     try:
         budget = round(float(message.text.replace(",", ".")), 2)
         user_id = message.from_user.id
-        
-        # Записываем budget
         supabase.table("users").update({"monthly_budget": budget}).eq("telegram_id", user_id).execute()
         
-        # Получаем ранее сохраненный баланс
         user_res = supabase.table("users").select("balance").eq("telegram_id", user_id).execute()
         raw_bal = user_res.data[0].get("balance") if user_res.data else 0.0
         balance = float(raw_bal) if raw_bal is not None else 0.0
@@ -118,11 +132,8 @@ async def cmd_profile(message: Message):
     
     if response.data:
         user = response.data[0]
-        raw_bal = user.get('balance')
-        raw_bud = user.get('monthly_budget')
-        balance = float(raw_bal) if raw_bal is not None else 0.0
-        budget = float(raw_bud) if raw_bud is not None else 0.0
-        
+        balance = float(user.get('balance') or 0.0)
+        budget = float(user.get('monthly_budget') or 0.0)
         await message.answer(
             f"📊 **Твой финансовый профиль:**\n\n"
             f"💰 Доступно средств: **{balance:.2f} ₽**\n"
@@ -131,7 +142,7 @@ async def cmd_profile(message: Message):
     else:
         await message.answer("Профиль не найден. Напиши /start для регистрации.")
 
-# Функция парсинга через AI Groq
+# Функция парсинга через AI Groq (с подстраховкой)
 def parse_financial_text(text: str) -> dict:
     prompt = f"""
     Ты — универсальный парсер финансовых транзакций. Проанализируй текст и выдели сумму, тип и категорию.
@@ -139,21 +150,24 @@ def parse_financial_text(text: str) -> dict:
     Текст: "{text}"
     
     Правила:
-    1. Сумма "amount" — это любые цифры в тексте (включая записи вида "Кофе100" -> 100). Если цифры отсутствуют, верни 0.
+    1. "amount": число (любые цифры в тексте, например "Кофе100" -> 100). Если цифр нет, верни 0.
     2. "type": "expense" (расход/покупка/оплата) или "income" (доход/зарплата/перевод мне).
     3. "category": название категории с большой буквы на русском (например: "Такси", "Продукты", "Жилье", "Кофе", "Развлечения").
     
-    Верни СТРОГО valid JSON без разметки markdown:
-    {{"amount": 350, "type": "expense", "category": "Такси"}}
+    Верни СТРОГО valid JSON:
+    {{"amount": 100, "type": "expense", "category": "Кофе"}}
     """
     
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-    
-    return json.loads(response.choices[0].message.content)
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",  # Используем официально поддерживаемую модель Groq
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logging.warning(f"⚠️ Groq API недоступен ({e}), переключаемся на резервный парсер.")
+        return fallback_parse(text)
 
 # Сохранение транзакции
 async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, message: Message):
@@ -166,7 +180,6 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
             await message.answer("Не удалось распознать сумму. Попробуй еще раз, например: «Кофе 250»")
             return
 
-        # 1. Запись транзакции в Supabase
         supabase.table("transactions").insert({
             "telegram_id": int(user_id),
             "amount": amount,
@@ -175,9 +188,7 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
             "raw_text": str(raw_text)
         }).execute()
 
-        # 2. Обновление баланса пользователя
         user_res = supabase.table("users").select("balance").eq("telegram_id", user_id).execute()
-        
         if user_res.data:
             raw_bal = user_res.data[0].get("balance")
             current_balance = float(raw_bal) if raw_bal is not None else 0.0
@@ -192,15 +203,12 @@ async def save_transaction(user_id: int, parsed_data: dict, raw_text: str, messa
                 f"{icon}**{amount:.2f} ₽** ({category})\n"
                 f"Текущий баланс: **{new_balance:.2f} ₽**"
             )
-        else:
-            await message.answer("Ошибка: профиль не найден. Напиши /start")
-
     except Exception as e:
         logging.error(f"❌ Ошибка в save_transaction: {e}")
         traceback.print_exc()
-        await message.answer("Ошибка при сохранении в базу данных. Напиши /start и попробуй снова.")
+        await message.answer("Ошибка сохранения данных. Напиши /start и попробуй снова.")
 
-# Обработка обычного текста
+# Обработка текстовых сообщений
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text_transaction(message: Message):
     try:
@@ -211,7 +219,7 @@ async def handle_text_transaction(message: Message):
         traceback.print_exc()
         await message.answer("Не смог распознать запись. Напиши понятнее, например: «Такси 350»")
 
-# Обработка голосовых сообщений
+# Обработка голосовых сообщений через Whisper AI
 @dp.message(F.voice)
 async def handle_voice_transaction(message: Message):
     file_id = message.voice.file_id
@@ -242,7 +250,6 @@ async def handle_voice_transaction(message: Message):
         if os.path.exists(local_voice_path):
             os.remove(local_voice_path)
 
-# Команда /stats
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     user_id = message.from_user.id
@@ -271,7 +278,6 @@ async def cmd_stats(message: Message):
         f"**Расходы по категориям:**\n{cat_text if cat_text else 'Нет расходов'}"
     )
 
-# Команда /audit
 @dp.message(Command("audit"))
 async def cmd_audit(message: Message):
     user_id = message.from_user.id
@@ -301,7 +307,7 @@ async def cmd_audit(message: Message):
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama3-8b-8192",
             messages=[{"role": "user", "content": prompt}]
         )
         audit_text = response.choices[0].message.content
@@ -310,7 +316,6 @@ async def cmd_audit(message: Message):
         logging.error(f"Ошибка аудита: {e}")
         await message.answer("Не удалось сгенерировать аудит. Попробуй позже.")
 
-# Сервер заглушка для Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
