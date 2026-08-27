@@ -52,9 +52,10 @@ if not gemini_client and not groq_client:
 
 # Стабильный каскад рабочих моделей
 CASCADE_MODELS = [
+    {"provider": "gemini", "name": "gemini-1.5-flash"},
+    {"provider": "gemini", "name": "gemini-2.0-flash"},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
-    {"provider": "groq",   "name": "llama3-8b-8192"},
-    {"provider": "gemini", "name": "gemini-1.5-flash"}
+    {"provider": "groq",   "name": "llama-3.1-8b-instant"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -62,6 +63,7 @@ def safe_llm_completion(prompt: str) -> str:
         provider = model_info["provider"]
         model_name = model_info["name"]
         try:
+            # Блок работы с Groq
             if provider == "groq" and groq_client:
                 response = groq_client.chat.completions.create(
                     model=model_name,
@@ -71,6 +73,7 @@ def safe_llm_completion(prompt: str) -> str:
                 if response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content.strip()
 
+            # Блок работы с Gemini
             elif provider == "gemini" and gemini_client:
                 response = gemini_client.models.generate_content(
                     model=model_name, 
@@ -78,6 +81,7 @@ def safe_llm_completion(prompt: str) -> str:
                 )
                 if response.text:
                     return response.text.strip()
+
         except Exception as e:
             logging.warning(f"Ошибка модели [{provider}:{model_name}] -> {e}")
             continue
