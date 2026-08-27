@@ -9,7 +9,7 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, BotCommand, BotCommandScopeDefault
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -40,8 +40,7 @@ dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Точная рабочая модель из логов вашего аккаунта
-# Список доступных моделей Groq по приоритету (от легких к тяжелым)
+# Список доступных моделей Groq по приоритету (от экономных к тяжелым)
 AVAILABLE_MODELS = [
     "groq/compound-mini",
     "qwen/qwen3.6-27b",
@@ -50,7 +49,7 @@ AVAILABLE_MODELS = [
 ]
 
 def safe_groq_completion(prompt: str) -> str:
-    """Пробует отправить запрос к Groq по очереди через разные модели при ошибках/лимитах."""
+    """Перебирает доступные модели Groq при исчерпании лимитов или ошибках."""
     for model_name in AVAILABLE_MODELS:
         try:
             response = groq_client.chat.completions.create(
@@ -60,7 +59,7 @@ def safe_groq_completion(prompt: str) -> str:
             logging.info(f"✅ Успешный ответ от модели Groq: {model_name}")
             return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.warning(f"⚠️ Модель {model_name} временно недоступна ({e}). Пробуем следующую...")
+            logging.warning(f"⚠️ Модель {model_name} недоступна ({e}). Переходим к следующей...")
     
     raise Exception("Все модели Groq временно недоступны из-за лимитов.")
 
@@ -83,7 +82,7 @@ def normalize_category(raw_category: str) -> str:
         
     return raw_category.capitalize()
 
-# Резервный парсер
+# Резервный локальный парсер
 def fallback_parse(text: str) -> dict:
     text_lower = text.lower().strip()
     numbers = re.findall(r'\d+(?:[\.,]\d+)?', text_lower)
@@ -99,9 +98,25 @@ def fallback_parse(text: str) -> dict:
     
     return {"amount": amount, "type": tx_type, "category": normalize_category(raw_cat)}
 
+# Состояния FSM
 class ProfileSetup(StatesGroup):
     waiting_for_balance = State()
     waiting_for_budget = State()
+
+class ChatSetup(StatesGroup):
+    in_chat = State()  # Состояние свободного общения с ИИ
+
+# Настройка выпадающего меню Telegram
+async def set_main_menu(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="🚀 Перезапустить / Старт"),
+        BotCommand(command="chat", description="💬 Пообщаться с ИИ (свободный диалог)"),
+        BotCommand(command="profile", description="📊 Мой баланс и бюджет"),
+        BotCommand(command="stats", description="📈 Аналитика трат по категориям"),
+        BotCommand(command="audit", description="🧠 AI-Аудит и советы по бюджету"),
+        BotCommand(command="reset", description="🔄 Сбросить профиль")
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -119,11 +134,42 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(
             "С возвращением!\n"
             "• Отправляй текст или голосовые (например, «обед 250» или «зарплата 50000»).\n"
-            "• /profile — твой баланс и бюджет.\n"
-            "• /stats — сводка расходов.\n"
-            "• /audit — советы от AI.\n"
-            "• /reset — сбросить профиль."
+            "• 💬 /chat — пообщаться с ИИ в свободном формате.\n"
+            "• 📊 /profile — твой баланс и бюджет.\n"
+            "• 📈 /stats — сводка расходов.\n"
+            "• 🧠 /audit — советы от AI.\n"
+            "• 🔄 /reset — сбросить профиль."
         )
+
+# РЕЖИМ СВОБОДНОГО ДИАЛОГА С ИИ
+@dp.message(Command("chat"))
+async def cmd_start_chat(message: Message, state: FSMContext):
+    await state.set_state(ChatSetup.in_chat)
+    await message.answer(
+        "💬 **Режим свободного общения с ИИ активирован!**\n\n"
+        "Спрашивай обо всем: от финансовых советов до бытовых тем.\n"
+        "Чтобы вернуть бота к трекингу расходов, напиши `/exit` или выбери любую команду в меню."
+    )
+
+@dp.message(Command("exit"), ChatSetup.in_chat)
+async def cmd_exit_chat(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🚪 Вы вышли из режима диалога. Теперь отправляемые сообщения снова записываются как расходы/доходы!")
+
+@dp.message(ChatSetup.in_chat, F.text & ~F.text.startswith("/"))
+async def handle_ai_chat(message: Message):
+    prompt = f"""
+    Ты — дружелюбный и умный AI-ассистент. Пользователь общается с тобой в свободном формате.
+    Отвечай вежливо, лаконично (до 2-3 абзацев), поддерживай диалог на любые темы.
+    
+    Сообщение пользователя: "{message.text}"
+    """
+    try:
+        reply = safe_groq_completion(prompt)
+        await message.answer(reply)
+    except Exception as e:
+        logging.error(f"Ошибка чата ИИ: {e}")
+        await message.answer("Извини, не удалось обработать ответ. Попробуй спросить еще раз.")
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message, state: FSMContext):
@@ -185,12 +231,12 @@ async def cmd_profile(message: Message):
     else:
         await message.answer("Профиль не найден. Напиши /start для регистрации.")
 
-# Парсер с работающей моделью
+# Парсинг записей трат
 def parse_financial_text(text: str) -> dict:
     prompt = f"""
     Ты — финансовый классификатор. Разбери текст: "{text}"
     
-    Категории: Еда (включает: обед, ужин, завтрак, еда, продукты, кафе, ресторан), Кофе, Транспорт (такси, метро, автобус), Жилье, Развлечения, Доход, Другое.
+    Категории: Еда (включает: обед, ужин, завтрак, еда, продукты, кафе, ресторан), Кофе, Транспорт, Жилье, Развлечения, Доход, Другое.
     
     Верни строго чистый JSON без разметки:
     {{"amount": 100, "type": "expense", "category": "Еда"}}
@@ -205,7 +251,7 @@ def parse_financial_text(text: str) -> dict:
         data["category"] = normalize_category(data.get("category", "Другое"))
         return data
     except Exception as e:
-        logging.warning(f"⚠️ Все модели Groq недоступны ({e}), переходим на резервный локальный парсер.")
+        logging.warning(f"⚠️ Все модели Groq отказали ({e}), сработал резервный парсер.")
         return fallback_parse(text)
 
 # Сохранение транзакции
@@ -345,8 +391,8 @@ async def cmd_audit(message: Message):
         audit_text = safe_groq_completion(prompt)
         await message.answer(f"💡 **AI-Аудит твоего бюджета:**\n\n{audit_text}")
     except Exception as e:
-        logging.error(f"Ошибка генерации аудита: {e}")
-        await message.answer("Не удалось сгенерировать аудит (все модели сейчас перегружены). Попробуй через пару минут.")
+        logging.error(f"Ошибка аудита: {e}")
+        await message.answer("Не удалось сгенерировать аудит. Попробуй позже.")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -360,6 +406,7 @@ def run_dummy_server():
     server.serve_forever()
 
 async def main():
+    await set_main_menu(bot)
     threading.Thread(target=run_dummy_server, daemon=True).start()
     logging.info("Бот с AI-распознаванием запущен!")
     await dp.start_polling(bot)
