@@ -43,12 +43,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Актуальные и рабочие названия моделей
+# Использование гарантированно существующих моделей в Groq и Gemini
 CASCADE_MODELS = [
-    {"provider": "gemini", "name": "gemini-1.5-flash"},
-    {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
-    {"provider": "groq",   "name": "llama3-8b-8192"},
-    {"provider": "groq",   "name": "mixtral-8x7b-32768"}
+    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
+    {"provider": "groq",   "name": "mixtral-8x7b-32768"},
+    {"provider": "gemini", "name": "gemini-1.5-flash"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -56,26 +55,27 @@ def safe_llm_completion(prompt: str) -> str:
         provider = model_info["provider"]
         model_name = model_info["name"]
         try:
-            if provider == "gemini" and gemini_client:
+            if provider == "groq" and groq_client:
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7
+                )
+                if response.choices and response.choices[0].message.content:
+                    return response.choices[0].message.content.strip()
+                    
+            elif provider == "gemini" and gemini_client:
                 response = gemini_client.models.generate_content(
                     model=model_name, 
                     contents=prompt
                 )
                 if response.text:
                     return response.text.strip()
-                    
-            elif provider == "groq" and groq_client:
-                response = groq_client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                if response.choices and response.choices[0].message.content:
-                    return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.warning(f"Модель {provider}:{model_name} не ответила: {e}")
+            logging.warning(f"Ошибка ИИ {provider}:{model_name} -> {e}")
             continue
-     
-    raise Exception("Ни одна из ИИ-моделей не доступна.")
+            
+    raise Exception("Ни одна из ИИ-моделей не ответила.")
 
 # Клавиатуры
 def get_main_keyboard():
@@ -115,7 +115,7 @@ async def set_main_menu(bot: Bot):
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 # ==========================================
-# 1. ГЛАВНЫЕ КОМАНДЫ И НАВИГАЦИЯ (Высокий приоритет)
+# 1. ГЛАВНОЕ МЕНЮ И СБРОС СОСТОЯНИЙ
 # ==========================================
 @dp.message(Command("start"))
 @dp.message(F.text.contains("Общение с ИИ"))
@@ -149,28 +149,39 @@ async def start_translator(message: Message, state: FSMContext):
 @dp.message(F.text == "📊 Назад в аудитор")
 async def start_finance(message: Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
+    user_id = int(message.from_user.id)
     
-    if not res.data:
-        await message.answer("👋 Укажите Имя владельца профиля (например: Иван):", reply_markup=ReplyKeyboardRemove())
-        await state.set_state(ModeStates.waiting_for_name)
-    else:
-        prof = res.data[0]
-        # Безопасно получаем ID (пробуем 'id', затем 'telegram_id')
-        current_profile_id = prof.get("id") or prof.get("telegram_id")
-        
-        await state.update_data(profile_id=current_profile_id)
-        await state.set_state(ModeStates.finance_menu)
-        
-        await message.answer(
-            f"📊 Финансовый аудитор (Профиль: {prof.get('name', 'Основной')})\n"
-            f"💰 Баланс: {prof.get('balance', 0):.2f} ₽ | План: {prof.get('monthly_budget', 0):.2f} ₽\n\n"
-            f"Выберите действие:",
-            reply_markup=get_finance_keyboard()
-        )
+    try:
+        res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
+        if not res.data:
+            await message.answer("👋 Укажите Имя владельца профиля (например: Иван):", reply_markup=ReplyKeyboardRemove())
+            await state.set_state(ModeStates.waiting_for_name)
+        else:
+            data = await state.get_data()
+            current_pid = data.get("profile_id")
+            
+            prof = res.data[0]
+            if current_pid:
+                found = next((p for p in res.data if p.get("id") == current_pid), None)
+                if found: prof = found
+                
+            pid = prof.get("id") or prof.get("telegram_id")
+            await state.update_data(profile_id=pid)
+            await state.set_state(ModeStates.finance_menu)
+            
+            await message.answer(
+                f"📊 Финансовый аудитор (Профиль: {prof.get('name', 'Основной')})\n"
+                f"💰 Баланс: {float(prof.get('balance', 0)):.2f} ₽ | План: {float(prof.get('monthly_budget', 0)):.2f} ₽\n\n"
+                f"Выберите действие:",
+                reply_markup=get_finance_keyboard()
+            )
+    except Exception as e:
+        logging.error(f"Ошибка при входе в финансы: {e}")
+        await message.answer("Ошибка при подключении к базе данных.")
 
-
+# ==========================================
+# 2. СОЗДАНИЕ И УПРАВЛЕНИЕ ПРОФИЛЯМИ
+# ==========================================
 @dp.message(ModeStates.waiting_for_name, F.text & ~F.text.startswith("/"))
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(new_name=message.text.strip())
@@ -192,11 +203,12 @@ async def process_budget(message: Message, state: FSMContext):
     try:
         budget = float(message.text.replace(",", "."))
         data = await state.get_data()
-        user_id = message.from_user.id
+        user_id = int(message.from_user.id)
         
         name = data.get("new_name", "Основной")
-        balance = data.get("new_balance", 0.0)
+        balance = float(data.get("new_balance", 0.0))
         
+        # Запись в Supabase
         res = supabase.table("users").insert({
             "telegram_id": user_id,
             "name": name,
@@ -205,22 +217,23 @@ async def process_budget(message: Message, state: FSMContext):
         }).execute()
         
         if res.data:
-            profile_id = res.data[0]["id"]
+            profile_id = res.data[0].get("id") or res.data[0].get("telegram_id")
             await state.update_data(profile_id=profile_id)
             await state.set_state(ModeStates.finance_menu)
             await message.answer(f"🎉 Профиль «{name}» успешно создан!", reply_markup=get_finance_keyboard())
         else:
-            await message.answer("Не удалось создать профиль в базе данных.")
+            raise Exception("База вернула пустой результат")
+            
     except ValueError:
-        await message.answer("Пожалуйста, введите число бюджетов (например, 8000).")
+        await message.answer("Введите числовое значение для бюджета.")
     except Exception as e:
-        logging.error(f"Ошибка БД при создании профиля: {e}")
-        await message.answer("Произошла ошибка при сохранении профиля. Попробуйте снова ввести имя по команде /finance")
+        logging.error(f"Критическая ошибка создания профиля: {e}")
+        await message.answer("Произошла ошибка при сохранении профиля в БД. Попробуйте еще раз с помощью /finance")
         await state.clear()
 
 @dp.message(ModeStates.finance_menu, F.text == "👤 Управление профилями")
 async def manage_profiles(message: Message, state: FSMContext):
-    user_id = message.from_user.id
+    user_id = int(message.from_user.id)
     res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
     
     text = "📂 Ваши профили:\n\n"
@@ -239,11 +252,12 @@ async def manage_profiles(message: Message, state: FSMContext):
 @dp.message(ModeStates.selecting_profile, F.text.startswith("Выбрать: "))
 async def select_profile(message: Message, state: FSMContext):
     name = message.text.replace("Выбрать: ", "").strip()
-    user_id = message.from_user.id
+    user_id = int(message.from_user.id)
     res = supabase.table("users").select("*").eq("telegram_id", user_id).eq("name", name).execute()
     
     if res.data:
-        await state.update_data(profile_id=res.data[0]["id"])
+        pid = res.data[0].get("id") or res.data[0].get("telegram_id")
+        await state.update_data(profile_id=pid)
         await message.answer(f"✅ Переключено на профиль: {name}")
     await start_finance(message, state)
 
@@ -258,7 +272,6 @@ async def delete_profile(message: Message, state: FSMContext):
     pid = data.get("profile_id")
     if pid:
         supabase.table("users").delete().eq("id", pid).execute()
-        supabase.table("transactions").delete().eq("profile_id", pid).execute()
         await message.answer("🗑 Профиль удален!")
     await start_finance(message, state)
 
@@ -272,11 +285,12 @@ async def finance_stats(message: Message, state: FSMContext):
         await message.answer("Нет транзакций.")
         return
         
-    total_exp = sum(float(t["amount"]) for t in res.data if t["type"] == "expense")
+    total_exp = sum(float(t["amount"]) for t in res.data if t.get("type") == "expense")
     cats = {}
     for t in res.data:
-        if t["type"] == "expense":
-            cats[t["category"]] = cats.get(t["category"], 0) + float(t["amount"])
+        if t.get("type") == "expense":
+            c = t.get("category", "Разное")
+            cats[c] = cats.get(c, 0) + float(t.get("amount", 0))
             
     cat_str = "\n".join([f"• {k}: {v:.2f} ₽" for k, v in cats.items()])
     await message.answer(f"📈 Расходы по категориям:\n\n{cat_str}\n\n🔴 Всего: {total_exp:.2f} ₽")
@@ -285,14 +299,19 @@ async def finance_stats(message: Message, state: FSMContext):
 async def finance_audit(message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("profile_id")
-    prof = supabase.table("users").select("*").eq("id", pid).execute().data[0]
+    
+    prof_res = supabase.table("users").select("*").eq("id", pid).execute()
+    if not prof_res.data:
+        await message.answer("Профиль не найден.")
+        return
+    prof = prof_res.data[0]
     txs = supabase.table("transactions").select("*").eq("profile_id", pid).limit(30).execute().data
     
-    prompt = f"Сделай краткий финансовый аудит для {prof['name']}. Бюджет: {prof['monthly_budget']} ₽, Баланс: {prof['balance']} ₽. Транзакции: {txs}"
+    prompt = f"Сделай краткий финансовый аудит для {prof.get('name')}. Бюджет: {prof.get('monthly_budget')} ₽, Баланс: {prof.get('balance')} ₽. Транзакции: {txs}"
     try:
         reply = safe_llm_completion(prompt)
         await message.answer(f"💡 AI-Аудит:\n\n{reply}")
-    except:
+    except Exception as e:
         await message.answer("Не удалось сгенерировать аудит.")
 
 @dp.message(ModeStates.finance_menu, F.text == "➕ Внести расход/доход")
@@ -301,52 +320,53 @@ async def add_tx_prompt(message: Message, state: FSMContext):
     await message.answer("Отправьте текст или голосовое (например: «Обед 300» или «Зарплата 50000»):")
 
 # ==========================================
-# 3. ПЕРЕВОД И ФИНАНСОВЫЕ ЗАПИСИ
+# 3. ОБРАБОТЧИКИ ПЕРЕВОДА И ОПЕРАЦИЙ
 # ==========================================
 async def process_translation(text: str, message: Message):
     prompt = f"""
     Ты — профессиональный переводчик.
     Правила:
     1. Если пользователь явно попросил перевести на конкретный язык (например, "переведи на японский..."), переведи на этот язык.
-    2. Если текст на ЛЮБОМ иностранном языке (английский, немецкий, китайский и т.д.) — переведи его НА РУССКИЙ ЯЗЫК.
+    2. Если текст на ЛЮБОМ иностранном языке — переведи его НА РУССКИЙ ЯЗЫК.
     3. Если текст на русском языке — переведи его НА АНГЛИЙСКИЙ ЯЗЫК.
     
-    Верни ТОЛЬКО перевод без комментариев.
-    
+    Верни ТОЛЬКО перевод без вводных слов.
     Текст: {text}
     """
     try:
         translated = safe_llm_completion(prompt)
         await message.answer(f"🔀 Перевод:\n\n{translated}")
-    except Exception as e:
+    except Exception:
         await message.answer("Ошибка сервиса перевода.")
 
 async def process_transaction_text(text: str, message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("profile_id")
-    prompt = f'Разбери запись: "{text}". Верни JSON: {{"amount": 100, "type": "expense", "category": "Еда"}}'
+    prompt = f'Разбери запись: "{text}". Верни JSON без лишних слов: {{"amount": 100, "type": "expense", "category": "Еда"}}'
     try:
         raw = safe_llm_completion(prompt)
-        if "```" in raw: raw = raw.split("```")[1].replace("json", "").strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].replace("json", "").strip()
         parsed = json.loads(raw)
         
         amt = float(parsed["amount"])
         supabase.table("transactions").insert({
-            "telegram_id": message.from_user.id,
+            "telegram_id": int(message.from_user.id),
             "profile_id": pid,
             "amount": amt,
-            "type": parsed["type"],
-            "category": parsed["category"],
+            "type": parsed.get("type", "expense"),
+            "category": parsed.get("category", "Разное"),
             "raw_text": text
         }).execute()
         
-        await message.answer(f"✅ Записано: {amt} ₽ ({parsed['category']})", reply_markup=get_finance_keyboard())
+        await message.answer(f"✅ Записано: {amt} ₽ ({parsed.get('category')})", reply_markup=get_finance_keyboard())
         await state.set_state(ModeStates.finance_menu)
     except Exception as e:
-        await message.answer("Ошибка распознавания записи.")
+        logging.error(f"Ошибка парсинга транзакции: {e}")
+        await message.answer("Ошибка распознавания записи. Попробуйте еще раз.")
 
 # ==========================================
-# 4. ОБРАБОТЧИКИ СООБЩЕНИЙ ПО УМОЛЧАНИЮ
+# 4. ВХОДЯЩИЕ СООБЩЕНИЯ И ГОЛОС
 # ==========================================
 @dp.message(ModeStates.translator, F.text & ~F.text.startswith("/"))
 async def handle_translator_text(message: Message):
@@ -381,6 +401,7 @@ async def handle_voice_global(message: Message, state: FSMContext):
             reply = safe_llm_completion(f"Ответь пользователю: {text}")
             await message.answer(f"🗣 «{text}»\n\n🤖 {reply}")
     except Exception as e:
+        logging.error(f"Ошибка Whisper: {e}")
         await message.answer("Ошибка распознавания голоса.")
     finally:
         if os.path.exists(local_path):
@@ -389,9 +410,10 @@ async def handle_voice_global(message: Message, state: FSMContext):
 @dp.message(F.text & ~F.text.startswith("/"))
 async def default_ai_chat(message: Message):
     try:
-        reply = safe_llm_completion(f"Ты — полезный ИИ-ассистент. Ответь пользователю: {message.text}")
+        reply = safe_llm_completion(message.text)
         await message.answer(reply)
     except Exception as e:
+        logging.error(f"Ошибка главного ИИ: {e}")
         await message.answer("Ошибка генерации ответа.")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
