@@ -41,7 +41,28 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Точная рабочая модель из логов вашего аккаунта
-WORKING_MODEL = "groq/compound"
+# Список доступных моделей Groq по приоритету (от легких к тяжелым)
+AVAILABLE_MODELS = [
+    "groq/compound-mini",
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-20b",
+    "groq/compound"
+]
+
+def safe_groq_completion(prompt: str) -> str:
+    """Пробует отправить запрос к Groq по очереди через разные модели при ошибках/лимитах."""
+    for model_name in AVAILABLE_MODELS:
+        try:
+            response = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            logging.info(f"✅ Успешный ответ от модели Groq: {model_name}")
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logging.warning(f"⚠️ Модель {model_name} временно недоступна ({e}). Пробуем следующую...")
+    
+    raise Exception("Все модели Groq временно недоступны из-за лимитов.")
 
 # Нормализатор категорий (объединяет синонимы)
 def normalize_category(raw_category: str) -> str:
@@ -169,18 +190,14 @@ def parse_financial_text(text: str) -> dict:
     prompt = f"""
     Ты — финансовый классификатор. Разбери текст: "{text}"
     
-    Категории: Еда (обед, ужин, еда, продукты), Кофе, Транспорт, Жилье, Развлечения, Доход, Другое.
+    Категории: Еда (включает: обед, ужин, завтрак, еда, продукты, кафе, ресторан), Кофе, Транспорт (такси, метро, автобус), Жилье, Развлечения, Доход, Другое.
     
     Верни строго чистый JSON без разметки:
     {{"amount": 100, "type": "expense", "category": "Еда"}}
     """
     
     try:
-        response = groq_client.chat.completions.create(
-            model=WORKING_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = safe_groq_completion(prompt)
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
         
@@ -188,7 +205,7 @@ def parse_financial_text(text: str) -> dict:
         data["category"] = normalize_category(data.get("category", "Другое"))
         return data
     except Exception as e:
-        logging.warning(f"⚠️ Ошибка Groq API ({e}), переходим на резервный парсер.")
+        logging.warning(f"⚠️ Все модели Groq недоступны ({e}), переходим на резервный локальный парсер.")
         return fallback_parse(text)
 
 # Сохранение транзакции
@@ -305,7 +322,7 @@ async def cmd_audit(message: Message):
     tx_res = supabase.table("transactions").select("*").eq("telegram_id", user_id).limit(30).execute()
     
     if not tx_res.data:
-        await message.answer("Недостаточно данных для анализа.")
+        await message.answer("Недостаточно данных для анализа. Добавь хотя бы 3–5 расходов!")
         return
 
     await message.answer("🧠 Анализирую твои финансы и готовлю аудит...")
@@ -318,22 +335,18 @@ async def cmd_audit(message: Message):
     Месячный бюджет: {user_data.get('monthly_budget', 0)} ₽
     Текущий баланс: {user_data.get('balance', 0)} ₽
     
-    История операций:
+    История последних операций:
     {history_summary}
     
-    Сделай краткий финансовый аудит с 2-3 советами на русском языке.
+    Сделай краткий финансовый аудит с 2-3 полезными советами на русском языке.
     """
 
     try:
-        response = groq_client.chat.completions.create(
-            model=WORKING_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        audit_text = response.choices[0].message.content
+        audit_text = safe_groq_completion(prompt)
         await message.answer(f"💡 **AI-Аудит твоего бюджета:**\n\n{audit_text}")
     except Exception as e:
-        logging.error(f"Ошибка аудита: {e}")
-        await message.answer("Не удалось сгенерировать аудит. Попробуй позже.")
+        logging.error(f"Ошибка генерации аудита: {e}")
+        await message.answer("Не удалось сгенерировать аудит (все модели сейчас перегружены). Попробуй через пару минут.")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
