@@ -15,6 +15,8 @@ from groq import Groq
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+load_dotenv()
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -118,7 +120,7 @@ def parse_financial_text(text: str) -> dict:
     """
     
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
@@ -264,7 +266,7 @@ async def cmd_audit(message: Message):
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}]
         )
         audit_text = response.choices[0].message.content
