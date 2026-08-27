@@ -328,6 +328,17 @@ def run_dummy_server():
     server.serve_forever()
 
 async def main():
+    # 1. Автоматически проверяем и выводим в логи доступные модели Groq
+    try:
+        models = groq_client.models.list()
+        available_ids = [m.id for m in models.data]
+        logging.info("=" * 50)
+        logging.info(f"✅ ДОСТУПНЫЕ МОДЕЛИ GROQ ДЛЯ ВАШЕГО КЛЮЧА:\n{available_ids}")
+        logging.info("=" * 50)
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения списка моделей Groq: {e}")
+
+    # 2. Запускаем заглушку порта и Telegram-бота
     threading.Thread(target=run_dummy_server, daemon=True).start()
     logging.info("Бот с AI-распознаванием запущен!")
     await dp.start_polling(bot)
