@@ -3,8 +3,6 @@ import sys
 import json
 import logging
 import threading
-import traceback
-import re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -22,7 +20,6 @@ from dotenv import load_dotenv
 from google import genai
 from groq import Groq
 
-# Логирование
 logging.basicConfig(level=logging.INFO)
 
 env_path = Path(__file__).parent / ".env"
@@ -36,7 +33,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN:
-    logging.error("ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
+    logging.error("TELEGRAM_BOT_TOKEN не найден!")
     sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN)
@@ -68,8 +65,8 @@ def safe_llm_completion(prompt: str) -> str:
                 )
                 return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.warning(f"⚠️ Модель {provider}:{model_name} недоступна: {e}")
-    raise Exception("Все модели недоступны.")
+            logging.warning(f"Модель {provider}:{model_name} ошибка: {e}")
+    raise Exception("Все ИИ-модели недоступны.")
 
 # Клавиатуры
 def get_main_keyboard():
@@ -91,22 +88,15 @@ def get_finance_keyboard():
         resize_keyboard=True
     )
 
-# Состояния FSM
 class ModeStates(StatesGroup):
     translator = State()
     finance_menu = State()
-    
-    # Финансовый профиль
     waiting_for_name = State()
     waiting_for_balance = State()
     waiting_for_budget = State()
     waiting_for_tx = State()
-    
-    # Профили
     selecting_profile = State()
-    confirm_delete = State()
 
-# --- МЕНЮ КОМАНД TELEGRAM ---
 async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="🏠 Главное меню / Общение с ИИ"),
@@ -115,28 +105,29 @@ async def set_main_menu(bot: Bot):
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
+# ==========================================
+# 1. ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ (Приоритетная обработка)
+# ==========================================
 @dp.message(Command("start"))
+@dp.message(F.text.contains("Общение с ИИ"))
 @dp.message(F.text == "🏠 Главное меню (Общение с ИИ)")
-@dp.message(F.text == "💬 Общение с ИИ (По умолчанию)")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "💬 **Вы в режиме свободного общения с ИИ (По умолчанию).**\n\n"
+        "💬 Режим свободного общения с ИИ (По умолчанию)\n\n"
         "Задавайте любые вопросы текстом или голосом!\n"
         "Для переключения режимов используйте меню ниже.",
         reply_markup=get_main_keyboard()
     )
 
-# ==========================================
-# 2. РЕЖИМ ПЕРЕВОДЧИКА
-# ==========================================
 @dp.message(Command("translator"))
-@dp.message(F.text == "🌐 Переводчик")
+@dp.message(F.text.contains("Переводчик"))
 async def start_translator(message: Message, state: FSMContext):
+    await state.clear()
     await state.set_state(ModeStates.translator)
     await message.answer(
-        "🌐 **Режим Переводчика активирован!**\n\n"
-        "Отправляйте текст или **голосовые сообщения** на любом языке — я переведу их на русский (или наоборот).\n\n"
+        "🌐 Режим Переводчика активирован!\n\n"
+        "Отправляйте текст или голосовые сообщения — я переведу их на русский (или наоборот).\n\n"
         "Для выхода нажмите «🏠 Главное меню (Общение с ИИ)».",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="🏠 Главное меню (Общение с ИИ)")]],
@@ -144,47 +135,36 @@ async def start_translator(message: Message, state: FSMContext):
         )
     )
 
-@dp.message(ModeStates.translator, F.text & ~F.text.startswith("/"))
-async def handle_translator_text(message: Message):
-    prompt = f"Ты — профессиональный переводчик. Если текст на русском, переведи его на английский. Если на другом языке — переведи на русский. Верни ТОЛЬКО перевод без лишних слов:\n\n{message.text}"
-    try:
-        translated = safe_llm_completion(prompt)
-        await message.answer(f"🔀 **Перевод:**\n{translated}")
-    except Exception as e:
-        await message.answer("Ошибка перевода.")
-
-# ==========================================
-# 3. ФИНАНСОВЫЙ АУДИТОР (ПОДУЧЕТ)
-# ==========================================
 @dp.message(Command("finance"))
-@dp.message(F.text == "📊 Финансовый аудитор")
+@dp.message(F.text.contains("Финансовый аудитор"))
+@dp.message(F.text == "📊 Назад в аудитор")
 async def start_finance(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
     
     if not res.data:
-        await message.answer("👋 Добро пожаловать в Финансовый аудитор!\nУкажите **Имя владельца профиля** (например: Иван):", reply_markup=ReplyKeyboardRemove())
+        await message.answer("👋 Укажите Имя владельца профиля (например: Иван):", reply_markup=ReplyKeyboardRemove())
         await state.set_state(ModeStates.waiting_for_name)
     else:
-        # Берем первый профиль
-        data = await state.get_data()
-        current_profile_id = data.get("profile_id", res.data[0]["id"])
+        current_profile_id = res.data[0]["id"]
         await state.update_data(profile_id=current_profile_id)
-        
-        prof = next((p for p in res.data if p["id"] == current_profile_id), res.data[0])
+        prof = res.data[0]
         await state.set_state(ModeStates.finance_menu)
         await message.answer(
-            f"📊 **Финансовый аудитор** (Активный профиль: **{prof.get('name', 'Основной')}**)\n"
+            f"📊 Финансовый аудитор (Профиль: {prof.get('name', 'Основной')})\n"
             f"💰 Баланс: {prof.get('balance', 0):.2f} ₽ | План: {prof.get('monthly_budget', 0):.2f} ₽\n\n"
             f"Выберите действие:",
             reply_markup=get_finance_keyboard()
         )
 
-# Создание нового профиля
+# ==========================================
+# 2. ФИНАНСЫ: СОЗДАНИЕ И ПРОФИЛИ
+# ==========================================
 @dp.message(ModeStates.waiting_for_name)
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(new_name=message.text.strip())
-    await message.answer("Укажите текущий **наличный баланс** (числом):")
+    await message.answer("Укажите текущий наличный баланс (числом):")
     await state.set_state(ModeStates.waiting_for_balance)
 
 @dp.message(ModeStates.waiting_for_balance)
@@ -192,7 +172,7 @@ async def process_balance(message: Message, state: FSMContext):
     try:
         bal = float(message.text.replace(",", "."))
         await state.update_data(new_balance=bal)
-        await message.answer("Укажите **план расходов на месяц** (бюджет):")
+        await message.answer("Укажите план расходов на месяц (бюджет):")
         await state.set_state(ModeStates.waiting_for_budget)
     except:
         await message.answer("Пожалуйста, введите число.")
@@ -214,21 +194,20 @@ async def process_budget(message: Message, state: FSMContext):
         profile_id = res.data[0]["id"]
         await state.update_data(profile_id=profile_id)
         await state.set_state(ModeStates.finance_menu)
-        await message.answer(f"🎉 Профиль **{data['new_name']}** успешно создан!", reply_markup=get_finance_keyboard())
+        await message.answer(f"🎉 Профиль {data['new_name']} успешно создан!", reply_markup=get_finance_keyboard())
     except Exception as e:
         logging.error(f"Ошибка создания: {e}")
         await message.answer("Ошибка при создании профиля.")
 
-# Управление профилями (Смена/Удаление/Добавление)
 @dp.message(ModeStates.finance_menu, F.text == "👤 Управление профилями")
 async def manage_profiles(message: Message, state: FSMContext):
     user_id = message.from_user.id
     res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
     
-    text = "📂 **Ваши профили:**\n\n"
+    text = "📂 Ваши профили:\n\n"
     buttons = []
     for p in res.data:
-        text += f"• **{p['name']}** (Баланс: {p['balance']} ₽)\n"
+        text += f"• {p['name']} (Баланс: {p['balance']} ₽)\n"
         buttons.append([KeyboardButton(text=f"Выбрать: {p['name']}")])
         
     buttons.append([KeyboardButton(text="➕ Добавить новый профиль")])
@@ -246,25 +225,23 @@ async def select_profile(message: Message, state: FSMContext):
     
     if res.data:
         await state.update_data(profile_id=res.data[0]["id"])
-        await message.answer(f"✅ Переключено на профиль: **{name}**")
+        await message.answer(f"✅ Переключено на профиль: {name}")
     await start_finance(message, state)
 
 @dp.message(ModeStates.selecting_profile, F.text == "➕ Добавить новый профиль")
 async def add_new_profile_start(message: Message, state: FSMContext):
-    await message.answer("Введите **Имя** для нового профиля:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Введите Имя для нового профиля:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ModeStates.waiting_for_name)
 
 @dp.message(ModeStates.selecting_profile, F.text == "🗑 Удалить текущий профиль")
 async def delete_profile(message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("profile_id")
-    
     if pid:
         supabase.table("users").delete().eq("id", pid).execute()
         supabase.table("transactions").delete().eq("profile_id", pid).execute()
-        await message.answer("🗑 Профиль и все его транзакции успешно удалены!")
-        await state.clear()
-        await start_finance(message, state)
+        await message.answer("🗑 Профиль удален!")
+    await start_finance(message, state)
 
 @dp.message(ModeStates.finance_menu, F.text == "📈 Статистика")
 async def finance_stats(message: Message, state: FSMContext):
@@ -282,8 +259,8 @@ async def finance_stats(message: Message, state: FSMContext):
         if t["type"] == "expense":
             cats[t["category"]] = cats.get(t["category"], 0) + float(t["amount"])
             
-    cat_str = "\n".join([f"• {k}: **{v:.2f} ₽**" for k, v in cats.items()])
-    await message.answer(f"📈 **Расходы по категориям:**\n\n{cat_str}\n\n🔴 Всего: **{total_exp:.2f} ₽**")
+    cat_str = "\n".join([f"• {k}: {v:.2f} ₽" for k, v in cats.items()])
+    await message.answer(f"📈 Расходы по категориям:\n\n{cat_str}\n\n🔴 Всего: {total_exp:.2f} ₽")
 
 @dp.message(ModeStates.finance_menu, F.text == "🧠 AI-Аудит")
 async def finance_audit(message: Message, state: FSMContext):
@@ -295,7 +272,7 @@ async def finance_audit(message: Message, state: FSMContext):
     prompt = f"Сделай краткий финансовый аудит для {prof['name']}. Бюджет: {prof['monthly_budget']} ₽, Баланс: {prof['balance']} ₽. Транзакции: {txs}"
     try:
         reply = safe_llm_completion(prompt)
-        await message.answer(f"💡 **AI-Аудит:**\n\n{reply}")
+        await message.answer(f"💡 AI-Аудит:\n\n{reply}")
     except:
         await message.answer("Не удалось сгенерировать аудит.")
 
@@ -304,12 +281,21 @@ async def add_tx_prompt(message: Message, state: FSMContext):
     await state.set_state(ModeStates.waiting_for_tx)
     await message.answer("Отправьте текст или голосовое (например: «Обед 300» или «Зарплата 50000»):")
 
-@dp.message(ModeStates.waiting_for_tx, F.text)
-async def process_tx_text(message: Message, state: FSMContext):
+# ==========================================
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ
+# ==========================================
+async def process_translation(text: str, message: Message):
+    prompt = f"Ты — профессиональный переводчик. Переведи текст на противоположный язык (с русского на английский или наоборот). Верни ТОЛЬКО перевод без пояснений:\n\n{text}"
+    try:
+        translated = safe_llm_completion(prompt)
+        await message.answer(f"🔀 Перевод:\n\n{translated}")
+    except Exception as e:
+        await message.answer("Ошибка сервиса перевода.")
+
+async def process_transaction_text(text: str, message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("profile_id")
-    
-    prompt = f"Разбери запись: \"{message.text}\". Верни JSON: {{\"amount\": 100, \"type\": \"expense\", \"category\": \"Еда\"}}"
+    prompt = f'Разбери запись: "{text}". Верни JSON: {{"amount": 100, "type": "expense", "category": "Еда"}}'
     try:
         raw = safe_llm_completion(prompt)
         if "```" in raw: raw = raw.split("```")[1].replace("json", "").strip()
@@ -322,17 +308,25 @@ async def process_tx_text(message: Message, state: FSMContext):
             "amount": amt,
             "type": parsed["type"],
             "category": parsed["category"],
-            "raw_text": message.text
+            "raw_text": text
         }).execute()
         
-        await message.answer(f"✅ Записано: **{amt} ₽** ({parsed['category']})", reply_markup=get_finance_keyboard())
+        await message.answer(f"✅ Записано: {amt} ₽ ({parsed['category']})", reply_markup=get_finance_keyboard())
         await state.set_state(ModeStates.finance_menu)
     except Exception as e:
-        await message.answer("Ошибка распознавания.")
+        await message.answer("Ошибка распознавания записи.")
 
 # ==========================================
-# ОБРАБОТКА ГОЛОСА (АДАПТИВНАЯ)
+# 4. ТЕКСТ И ГОЛОС (ПО УМОЛЧАНИЮ И В РЕЖИМАХ)
 # ==========================================
+@dp.message(ModeStates.translator, F.text & ~F.text.startswith("/"))
+async def handle_translator_text(message: Message):
+    await process_translation(message.text, message)
+
+@dp.message(ModeStates.waiting_for_tx, F.text & ~F.text.startswith("/"))
+async def handle_tx_text(message: Message, state: FSMContext):
+    await process_transaction_text(message.text, message, state)
+
 @dp.message(F.voice)
 async def handle_voice_global(message: Message, state: FSMContext):
     file_id = message.voice.file_id
@@ -342,31 +336,34 @@ async def handle_voice_global(message: Message, state: FSMContext):
     
     try:
         with open(local_path, "rb") as f:
-            trans = groq_client.audio.transcriptions.create(file=(local_path, f.read()), model="whisper-large-v3", language="ru")
+            trans = groq_client.audio.transcriptions.create(
+                file=(local_path, f.read()),
+                model="whisper-large-v3",
+                language="ru"
+            )
         text = trans.text
-        
         current_state = await state.get_state()
+        
         if current_state == ModeStates.translator:
-            message.text = text
-            await handle_translator_text(message)
+            await process_translation(text, message)
         elif current_state == ModeStates.waiting_for_tx:
-            message.text = text
-            await process_tx_text(message, state)
+            await process_transaction_text(text, message, state)
         else:
-            # Общение с ИИ по умолчанию
-            reply = safe_llm_completion(f"Ответь на сообщение пользователю: {text}")
-            await message.answer(f"🗣 *«{text}»*\n\n🤖 {reply}")
+            reply = safe_llm_completion(f"Ответь пользователю: {text}")
+            await message.answer(f"🗣 «{text}»\n\n🤖 {reply}")
+    except Exception as e:
+        await message.answer("Ошибка распознавания голоса.")
     finally:
-        if os.path.exists(local_path): os.remove(local_path)
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
-# ОБРАБОТКА ТЕКСТА ПО УМОЛЧАНИЮ (ОБЩЕНИЕ С ИИ)
 @dp.message(F.text & ~F.text.startswith("/"))
 async def default_ai_chat(message: Message):
     try:
-        reply = safe_llm_completion(f"Ты — дружелюбный ассистент. Ответь пользователю: {message.text}")
+        reply = safe_llm_completion(f"Ты — полезный ИИ-ассистент. Ответь пользователю: {message.text}")
         await message.answer(reply)
     except Exception as e:
-        await message.answer("Извините, не удалось обработать запрос.")
+        await message.answer("Ошибка генерации ответа.")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -382,7 +379,7 @@ def run_dummy_server():
 async def main():
     await set_main_menu(bot)
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    logging.info("Бот запущен!")
+    logging.info("Бот обновлен и запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
