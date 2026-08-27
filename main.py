@@ -184,20 +184,46 @@ async def process_budget(message: Message, state: FSMContext):
         data = await state.get_data()
         user_id = message.from_user.id
         
+        # Используем upsert или безопасную вставку
         res = supabase.table("users").insert({
             "telegram_id": user_id,
-            "name": data["new_name"],
-            "balance": data["new_balance"],
+            "name": data.get("new_name", "Основной"),
+            "balance": data.get("new_balance", 0.0),
             "monthly_budget": budget
         }).execute()
         
-        profile_id = res.data[0]["id"]
-        await state.update_data(profile_id=profile_id)
-        await state.set_state(ModeStates.finance_menu)
-        await message.answer(f"🎉 Профиль {data['new_name']} успешно создан!", reply_markup=get_finance_keyboard())
+        if res.data:
+            profile_id = res.data[0]["id"]
+            await state.update_data(profile_id=profile_id)
+            await state.set_state(ModeStates.finance_menu)
+            await message.answer(f"🎉 Профиль «{data['new_name']}» успешно создан!", reply_markup=get_finance_keyboard())
+        else:
+            raise Exception("База данных не вернула ID профиля")
+            
     except Exception as e:
-        logging.error(f"Ошибка создания: {e}")
-        await message.answer("Ошибка при создании профиля.")
+        logging.error(f"Ошибка создания профиля: {e}")
+        # Если возникла ошибка дублирования, пробуем обновить существующую запись
+        try:
+            user_id = message.from_user.id
+            data = await state.get_data()
+            budget = float(message.text.replace(",", "."))
+            
+            res = supabase.table("users").update({
+                "name": data.get("new_name", "Основной"),
+                "balance": data.get("new_balance", 0.0),
+                "monthly_budget": budget
+            }).eq("telegram_id", user_id).execute()
+            
+            if res.data:
+                profile_id = res.data[0]["id"]
+                await state.update_data(profile_id=profile_id)
+                await state.set_state(ModeStates.finance_menu)
+                await message.answer(f"🎉 Профиль «{data['new_name']}» успешно обновлен!", reply_markup=get_finance_keyboard())
+            else:
+                await message.answer("Ошибка при создании профиля. Попробуйте еще раз с /start")
+        except Exception as err:
+            logging.error(f"Финальная ошибка: {err}")
+            await message.answer("Не удалось сохранить профиль в Supabase.")
 
 @dp.message(ModeStates.finance_menu, F.text == "👤 Управление профилями")
 async def manage_profiles(message: Message, state: FSMContext):
@@ -285,11 +311,23 @@ async def add_tx_prompt(message: Message, state: FSMContext):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ
 # ==========================================
 async def process_translation(text: str, message: Message):
-    prompt = f"Ты — профессиональный переводчик. Переведи текст на противоположный язык (с русского на английский или наоборот). Верни ТОЛЬКО перевод без пояснений:\n\n{text}"
+    prompt = f"""
+    Ты — интеллектуальный переводчик.
+    Правила:
+    1. Если пользователь явно просит перевести на конкретный язык (например, "переведи на японский..."), переведи на этот язык.
+    2. Если текст на иностранном языке (любом, кроме русского) — переведи его НА РУССКИЙ ЯЗЫК по умолчанию.
+    3. Если текст на русском языке — переведи его НА АНГЛИЙСКИЙ ЯЗЫК по умолчанию.
+    
+    Верни ТОЛЬКО готовый перевод без вводных фраз и комментариев.
+    
+    Текст для перевода:
+    {text}
+    """
     try:
         translated = safe_llm_completion(prompt)
         await message.answer(f"🔀 Перевод:\n\n{translated}")
     except Exception as e:
+        logging.error(f"Ошибка перевода: {e}")
         await message.answer("Ошибка сервиса перевода.")
 
 async def process_transaction_text(text: str, message: Message, state: FSMContext):
