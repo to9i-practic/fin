@@ -50,11 +50,11 @@ if not gemini_client and not groq_client:
     logging.error("Не задан ни один API-ключ для ИИ (GEMINI_API_KEY или GROQ_API_KEY)!")
     sys.exit(1)
 
+# Стабильный каскад рабочих моделей
 CASCADE_MODELS = [
-    {"provider": "gemini", "name": "gemini-2.0-flash"},
-    {"provider": "gemini", "name": "gemini-1.5-flash"},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
     {"provider": "groq",   "name": "llama3-8b-8192"},
+    {"provider": "gemini", "name": "gemini-1.5-flash"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -66,11 +66,11 @@ def safe_llm_completion(prompt: str) -> str:
                 response = groq_client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.7
+                    temperature=0.2
                 )
                 if response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content.strip()
-                    
+
             elif provider == "gemini" and gemini_client:
                 response = gemini_client.models.generate_content(
                     model=model_name, 
@@ -79,8 +79,59 @@ def safe_llm_completion(prompt: str) -> str:
                 if response.text:
                     return response.text.strip()
         except Exception as e:
-            logging.warning(f"Ошибка ИИ {provider}:{model_name} -> {e}")
+            logging.warning(f"Ошибка модели [{provider}:{model_name}] -> {e}")
             continue
+
+    raise Exception("Ни одна из ИИ-моделей не ответила.")
+
+async def process_transaction_text(text: str, message: Message, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("profile_id")
+    
+    prompt = (
+        f'Разбери финансовую запись: "{text}". '
+        f'Ответь ИСКЛЮЧИТЕЛЬНО валидным JSON без разметки markdown и без слова json. '
+        f'Формат: {{"amount": 500, "type": "expense", "category": "Напитки"}}'
+    )
+    
+    try:
+        raw = safe_llm_completion(prompt)
+        
+        # Очистка текста от возможных блоков кода ```json ... ```
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+        
+        parsed = json.loads(raw)
+        amt = float(parsed["amount"])
+        tx_type = parsed.get("type", "expense")
+        cat = parsed.get("category", "Разное")
+        
+        # Сохраняем транзакцию
+        supabase.table("transactions").insert({
+            "telegram_id": int(message.from_user.id),
+            "profile_id": pid,
+            "amount": amt,
+            "type": tx_type,
+            "category": cat,
+            "raw_text": text
+        }).execute()
+        
+        # Обновляем баланс текущего профиля
+        prof_res = supabase.table("users").select("balance").eq("id", pid).execute()
+        if prof_res.data:
+            current_bal = float(prof_res.data[0].get("balance", 0))
+            new_bal = current_bal - amt if tx_type == "expense" else current_bal + amt
+            supabase.table("users").update({"balance": new_bal}).eq("id", pid).execute()
+        
+        await message.answer(f"✅ Записано: {amt:.2f} ₽ ({cat})", reply_markup=get_finance_keyboard())
+        await state.set_state(ModeStates.finance_menu)
+        
+    except Exception as e:
+        logging.error(f"Ошибка парсинга транзакции: {e}")
+        await message.answer("Ошибка распознавания записи. Попробуйте ввести в формате: «Название Сумма» (например, Кофе 250»).")
             
     raise Exception("Ни одна из ИИ-моделей не ответила.")
 
