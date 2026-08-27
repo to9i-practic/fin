@@ -148,7 +148,7 @@ def parse_financial_text(text: str) -> dict:
     """
     
     response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
@@ -301,7 +301,7 @@ async def cmd_audit(message: Message):
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}]
         )
         audit_text = response.choices[0].message.content
