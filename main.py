@@ -15,6 +15,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from supabase import create_client, Client
 from dotenv import load_dotenv
+
+# Клиенты ИИ
+from google import genai
 from groq import Groq
 
 # Настройка логирования
@@ -29,41 +32,59 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN:
     logging.error("ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
     sys.exit(1)
 
-# Инициализация клиентов
+# Инициализация сервисов
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Список доступных моделей Groq по приоритету (от экономных к тяжелым)
-AVAILABLE_MODELS = [
-    "groq/compound-mini",
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-20b",
-    "groq/compound"
+# Инициализация ИИ провайдеров
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# Мультипровайдерный каскад моделей (по приоритету)
+CASCADE_MODELS = [
+    {"provider": "gemini", "name": "gemini-2.5-flash"},
+    {"provider": "groq",   "name": "groq/compound-mini"},
+    {"provider": "groq",   "name": "qwen/qwen3.6-27b"},
+    {"provider": "groq",   "name": "openai/gpt-oss-20b"},
+    {"provider": "groq",   "name": "groq/compound"}
 ]
 
-def safe_groq_completion(prompt: str) -> str:
-    """Перебирает доступные модели Groq при исчерпании лимитов или ошибках."""
-    for model_name in AVAILABLE_MODELS:
+def safe_llm_completion(prompt: str) -> str:
+    """Универсальный каскад: перебирает Gemini и Groq при ошибках лимита/доступности."""
+    for model_info in CASCADE_MODELS:
+        provider = model_info["provider"]
+        model_name = model_info["name"]
+        
         try:
-            response = groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            logging.info(f"✅ Успешный ответ от модели Groq: {model_name}")
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logging.warning(f"⚠️ Модель {model_name} недоступна ({e}). Переходим к следующей...")
-    
-    raise Exception("Все модели Groq временно недоступны из-за лимитов.")
+            if provider == "gemini" and gemini_client:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                logging.info(f"✅ Успешный ответ от Gemini ({model_name})")
+                return response.text.strip()
+                
+            elif provider == "groq" and groq_client:
+                response = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                logging.info(f"✅ Успешный ответ от Groq ({model_name})")
+                return response.choices[0].message.content.strip()
 
-# Нормализатор категорий (объединяет синонимы)
+        except Exception as e:
+            logging.warning(f"⚠️ Модель {provider}:{model_name} недоступна ({e}). Пробуем следующую...")
+
+    raise Exception("❌ Все доступные модели во всех провайдерах исчерпали лимиты.")
+
+# Нормализатор категорий
 def normalize_category(raw_category: str) -> str:
     cat = str(raw_category).lower().strip()
     
@@ -104,9 +125,9 @@ class ProfileSetup(StatesGroup):
     waiting_for_budget = State()
 
 class ChatSetup(StatesGroup):
-    in_chat = State()  # Состояние свободного общения с ИИ
+    in_chat = State()
 
-# Настройка выпадающего меню Telegram
+# Настройка интерактивного меню Telegram
 async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Перезапустить / Старт"),
@@ -134,14 +155,14 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(
             "С возвращением!\n"
             "• Отправляй текст или голосовые (например, «обед 250» или «зарплата 50000»).\n"
-            "• 💬 /chat — пообщаться с ИИ в свободном формате.\n"
-            "• 📊 /profile — твой баланс и бюджет.\n"
-            "• 📈 /stats — сводка расходов.\n"
-            "• 🧠 /audit — советы от AI.\n"
+            "• 💬 /chat — свободный диалог с ИИ.\n"
+            "• 📊 /profile — баланс и бюджет.\n"
+            "• 📈 /stats — статистика.\n"
+            "• 🧠 /audit — финансовый аудит.\n"
             "• 🔄 /reset — сбросить профиль."
         )
 
-# РЕЖИМ СВОБОДНОГО ДИАЛОГА С ИИ
+# Свободный диалог с ИИ
 @dp.message(Command("chat"))
 async def cmd_start_chat(message: Message, state: FSMContext):
     await state.set_state(ChatSetup.in_chat)
@@ -154,7 +175,7 @@ async def cmd_start_chat(message: Message, state: FSMContext):
 @dp.message(Command("exit"), ChatSetup.in_chat)
 async def cmd_exit_chat(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("🚪 Вы вышли из режима диалога. Теперь отправляемые сообщения снова записываются как расходы/доходы!")
+    await message.answer("🚪 Вы вышли из режима диалога. Сообщения снова записываются как расходы/доходы!")
 
 @dp.message(ChatSetup.in_chat, F.text & ~F.text.startswith("/"))
 async def handle_ai_chat(message: Message):
@@ -165,7 +186,7 @@ async def handle_ai_chat(message: Message):
     Сообщение пользователя: "{message.text}"
     """
     try:
-        reply = safe_groq_completion(prompt)
+        reply = safe_llm_completion(prompt)
         await message.answer(reply)
     except Exception as e:
         logging.error(f"Ошибка чата ИИ: {e}")
@@ -231,19 +252,16 @@ async def cmd_profile(message: Message):
     else:
         await message.answer("Профиль не найден. Напиши /start для регистрации.")
 
-# Парсинг записей трат
+# Парсинг финансовых записей
 def parse_financial_text(text: str) -> dict:
     prompt = f"""
     Ты — финансовый классификатор. Разбери текст: "{text}"
-    
     Категории: Еда (включает: обед, ужин, завтрак, еда, продукты, кафе, ресторан), Кофе, Транспорт, Жилье, Развлечения, Доход, Другое.
-    
     Верни строго чистый JSON без разметки:
     {{"amount": 100, "type": "expense", "category": "Еда"}}
     """
-    
     try:
-        raw = safe_groq_completion(prompt)
+        raw = safe_llm_completion(prompt)
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
         
@@ -251,7 +269,7 @@ def parse_financial_text(text: str) -> dict:
         data["category"] = normalize_category(data.get("category", "Другое"))
         return data
     except Exception as e:
-        logging.warning(f"⚠️ Все модели Groq отказали ({e}), сработал резервный парсер.")
+        logging.warning(f"⚠️ Все модели отказали ({e}), переходим на резервный парсер.")
         return fallback_parse(text)
 
 # Сохранение транзакции
@@ -313,6 +331,9 @@ async def handle_voice_transaction(message: Message):
     await bot.download_file(file_path, local_voice_path)
     
     try:
+        if not groq_client:
+            raise Exception("Groq client не инициализирован для Whisper.")
+
         with open(local_voice_path, "rb") as file_obj:
             transcription = groq_client.audio.transcriptions.create(
                 file=(local_voice_path, file_obj.read()),
@@ -326,7 +347,7 @@ async def handle_voice_transaction(message: Message):
         parsed = parse_financial_text(text)
         await save_transaction(message.from_user.id, parsed, text, message)
     except Exception as e:
-        logging.error(f"❌ Ошибка голоса: {e}")
+        logging.error(f"❌ Ошибка распознавания голоса: {e}")
         traceback.print_exc()
         await message.answer("Не удалось обработать голосовое сообщение.")
     finally:
@@ -388,7 +409,7 @@ async def cmd_audit(message: Message):
     """
 
     try:
-        audit_text = safe_groq_completion(prompt)
+        audit_text = safe_llm_completion(prompt)
         await message.answer(f"💡 **AI-Аудит твоего бюджета:**\n\n{audit_text}")
     except Exception as e:
         logging.error(f"Ошибка аудита: {e}")
@@ -408,7 +429,7 @@ def run_dummy_server():
 async def main():
     await set_main_menu(bot)
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    logging.info("Бот с AI-распознаванием запущен!")
+    logging.info("Бот с каскадным AI-распознаванием запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

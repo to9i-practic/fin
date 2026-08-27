@@ -1,4 +1,5 @@
+google-genai
+groq
 aiogram
 supabase
 python-dotenv
-groq
