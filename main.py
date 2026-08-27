@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import re
+import uuid
 import logging
 import threading
 from pathlib import Path
@@ -22,9 +24,9 @@ from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
 
+# Загрузка переменных окружения (один раз)
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
-load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -43,12 +45,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Использование гарантированно существующих моделей в Groq и Gemini
+# Проверка наличия хотя бы одного ИИ-провайдера
+if not gemini_client and not groq_client:
+    logging.error("Не задан ни один API-ключ для ИИ (GEMINI_API_KEY или GROQ_API_KEY)!")
+    sys.exit(1)
+
 CASCADE_MODELS = [
     {"provider": "gemini", "name": "gemini-2.0-flash"},
     {"provider": "gemini", "name": "gemini-1.5-flash"},
-    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
-    {"provider": "groq",   "name": "mixtral-8x7b-32768"},
+    {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
+    {"provider": "groq",   "name": "llama3-8b-8192"},
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -78,7 +84,6 @@ def safe_llm_completion(prompt: str) -> str:
             
     raise Exception("Ни одна из ИИ-моделей не ответила.")
 
-# Клавиатуры
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -115,9 +120,6 @@ async def set_main_menu(bot: Bot):
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
-# ==========================================
-# 1. ГЛАВНОЕ МЕНЮ И СБРОС СОСТОЯНИЙ
-# ==========================================
 @dp.message(Command("start"))
 @dp.message(F.text.contains("Общение с ИИ"))
 @dp.message(F.text == "🏠 Главное меню (Общение с ИИ)")
@@ -149,6 +151,10 @@ async def start_translator(message: Message, state: FSMContext):
 @dp.message(F.text.contains("Финансовый аудитор"))
 @dp.message(F.text == "📊 Назад в аудитор")
 async def start_finance(message: Message, state: FSMContext):
+    # Сначала сохраняем нужные данные из состояния до сброса
+    data = await state.get_data()
+    current_pid = data.get("profile_id")
+    
     await state.clear()
     user_id = int(message.from_user.id)
     
@@ -158,9 +164,6 @@ async def start_finance(message: Message, state: FSMContext):
             await message.answer("👋 Укажите Имя владельца профиля (например: Иван):", reply_markup=ReplyKeyboardRemove())
             await state.set_state(ModeStates.waiting_for_name)
         else:
-            data = await state.get_data()
-            current_pid = data.get("profile_id")
-            
             prof = res.data[0]
             if current_pid:
                 found = next((p for p in res.data if p.get("id") == current_pid), None)
@@ -180,9 +183,6 @@ async def start_finance(message: Message, state: FSMContext):
         logging.error(f"Ошибка при входе в финансы: {e}")
         await message.answer("Ошибка при подключении к базе данных.")
 
-# ==========================================
-# 2. СОЗДАНИЕ И УПРАВЛЕНИЕ ПРОФИЛЯМИ
-# ==========================================
 @dp.message(ModeStates.waiting_for_name, F.text & ~F.text.startswith("/"))
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(new_name=message.text.strip())
@@ -209,7 +209,6 @@ async def process_budget(message: Message, state: FSMContext):
         name = data.get("new_name", "Основной")
         balance = float(data.get("new_balance", 0.0))
         
-        # Запись в Supabase
         res = supabase.table("users").insert({
             "telegram_id": user_id,
             "name": name,
@@ -320,9 +319,6 @@ async def add_tx_prompt(message: Message, state: FSMContext):
     await state.set_state(ModeStates.waiting_for_tx)
     await message.answer("Отправьте текст или голосовое (например: «Обед 300» или «Зарплата 50000»):")
 
-# ==========================================
-# 3. ОБРАБОТЧИКИ ПЕРЕВОДА И ОПЕРАЦИЙ
-# ==========================================
 async def process_translation(text: str, message: Message):
     prompt = f"""
     Ты — профессиональный переводчик.
@@ -343,12 +339,16 @@ async def process_translation(text: str, message: Message):
 async def process_transaction_text(text: str, message: Message, state: FSMContext):
     data = await state.get_data()
     pid = data.get("profile_id")
-    prompt = f'Разбери запись: "{text}". Верни JSON без лишних слов: {{"amount": 100, "type": "expense", "category": "Еда"}}'
+    prompt = f'Разбери запись: "{text}". Верни ТОЛЬКО валидный JSON, без markdown-оберток и пояснений формата: {{"amount": 100, "type": "expense", "category": "Еда"}}'
     try:
         raw = safe_llm_completion(prompt)
-        if "```" in raw:
-            raw = raw.split("```")[1].replace("json", "").strip()
-        parsed = json.loads(raw)
+        
+        # Надежный парсинг JSON с помощью регулярного выражения
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            raise ValueError("Не удалось найти JSON в ответе ИИ")
+            
+        parsed = json.loads(match.group(0))
         
         amt = float(parsed["amount"])
         supabase.table("transactions").insert({
@@ -366,9 +366,6 @@ async def process_transaction_text(text: str, message: Message, state: FSMContex
         logging.error(f"Ошибка парсинга транзакции: {e}")
         await message.answer("Ошибка распознавания записи. Попробуйте еще раз.")
 
-# ==========================================
-# 4. ВХОДЯЩИЕ СООБЩЕНИЯ И ГОЛОС
-# ==========================================
 @dp.message(ModeStates.translator, F.text & ~F.text.startswith("/"))
 async def handle_translator_text(message: Message):
     await process_translation(message.text, message)
@@ -379,15 +376,22 @@ async def handle_tx_text(message: Message, state: FSMContext):
 
 @dp.message(F.voice)
 async def handle_voice_global(message: Message, state: FSMContext):
+    if not groq_client:
+        await message.answer("Распознавание речи временно недоступно.")
+        return
+
     file_id = message.voice.file_id
     file = await bot.get_file(file_id)
-    local_path = f"voice_{message.message_id}.ogg"
-    await bot.download_file(file.file_path, local_path)
+    
+    # Генерация уникального имени для временного файла
+    unique_filename = f"voice_{uuid.uuid4().hex}.ogg"
     
     try:
-        with open(local_path, "rb") as f:
+        await bot.download_file(file.file_path, unique_filename)
+        
+        with open(unique_filename, "rb") as f:
             trans = groq_client.audio.transcriptions.create(
-                file=(local_path, f.read()),
+                file=(unique_filename, f.read()),
                 model="whisper-large-v3",
                 language="ru"
             )
@@ -405,8 +409,8 @@ async def handle_voice_global(message: Message, state: FSMContext):
         logging.error(f"Ошибка Whisper: {e}")
         await message.answer("Ошибка распознавания голоса.")
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+        if os.path.exists(unique_filename):
+            os.remove(unique_filename)
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def default_ai_chat(message: Message):
