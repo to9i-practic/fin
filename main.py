@@ -45,9 +45,10 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Использование гарантированно существующих моделей в Groq и Gemini
 CASCADE_MODELS = [
+    {"provider": "gemini", "name": "gemini-2.0-flash"},
+    {"provider": "gemini", "name": "gemini-1.5-flash"}
     {"provider": "groq",   "name": "llama-3.1-8b-instant"},
     {"provider": "groq",   "name": "mixtral-8x7b-32768"},
-    {"provider": "gemini", "name": "gemini-1.5-flash"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
