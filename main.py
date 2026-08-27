@@ -1,4 +1,4 @@
-import os
+importimport os
 import sys
 import json
 import logging
@@ -43,11 +43,12 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# Актуальные и рабочие названия моделей
 CASCADE_MODELS = [
-    {"provider": "gemini", "name": "gemini-2.5-flash"},
-    {"provider": "groq",   "name": "groq/compound-mini"},
-    {"provider": "groq",   "name": "qwen/qwen3.6-27b"},
-    {"provider": "groq",   "name": "openai/gpt-oss-20b"}
+    {"provider": "gemini", "name": "gemini-1.5-flash"},
+    {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
+    {"provider": "groq",   "name": "llama3-8b-8192"},
+    {"provider": "groq",   "name": "mixtral-8x7b-32768"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -56,17 +57,25 @@ def safe_llm_completion(prompt: str) -> str:
         model_name = model_info["name"]
         try:
             if provider == "gemini" and gemini_client:
-                response = gemini_client.models.generate_content(model=model_name, contents=prompt)
-                return response.text.strip()
+                response = gemini_client.models.generate_content(
+                    model=model_name, 
+                    contents=prompt
+                )
+                if response.text:
+                    return response.text.strip()
+                    
             elif provider == "groq" and groq_client:
                 response = groq_client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                return response.choices[0].message.content.strip()
+                if response.choices and response.choices[0].message.content:
+                    return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.warning(f"Модель {provider}:{model_name} ошибка: {e}")
-    raise Exception("Все ИИ-модели недоступны.")
+            logging.warning(f"Модель {provider}:{model_name} не ответила: {e}")
+            continue
+     
+    raise Exception("Ни одна из ИИ-моделей не доступна.")
 
 # Клавиатуры
 def get_main_keyboard():
@@ -147,10 +156,13 @@ async def start_finance(message: Message, state: FSMContext):
         await message.answer("👋 Укажите Имя владельца профиля (например: Иван):", reply_markup=ReplyKeyboardRemove())
         await state.set_state(ModeStates.waiting_for_name)
     else:
-        current_profile_id = res.data[0]["id"]
-        await state.update_data(profile_id=current_profile_id)
         prof = res.data[0]
+        # Безопасно получаем ID (пробуем 'id', затем 'telegram_id')
+        current_profile_id = prof.get("id") or prof.get("telegram_id")
+        
+        await state.update_data(profile_id=current_profile_id)
         await state.set_state(ModeStates.finance_menu)
+        
         await message.answer(
             f"📊 Финансовый аудитор (Профиль: {prof.get('name', 'Основной')})\n"
             f"💰 Баланс: {prof.get('balance', 0):.2f} ₽ | План: {prof.get('monthly_budget', 0):.2f} ₽\n\n"
@@ -158,9 +170,7 @@ async def start_finance(message: Message, state: FSMContext):
             reply_markup=get_finance_keyboard()
         )
 
-# ==========================================
-# 2. ФИНАНСЫ: ПОШАГОВЫЙ ВВОД (FSM)
-# ==========================================
+
 @dp.message(ModeStates.waiting_for_name, F.text & ~F.text.startswith("/"))
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(new_name=message.text.strip())
