@@ -106,7 +106,7 @@ async def set_main_menu(bot: Bot):
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 # ==========================================
-# 1. ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ (Приоритетная обработка)
+# 1. ГЛАВНЫЕ КОМАНДЫ И НАВИГАЦИЯ (Высокий приоритет)
 # ==========================================
 @dp.message(Command("start"))
 @dp.message(F.text.contains("Общение с ИИ"))
@@ -159,36 +159,38 @@ async def start_finance(message: Message, state: FSMContext):
         )
 
 # ==========================================
-# 2. ФИНАНСЫ: СОЗДАНИЕ И ПРОФИЛИ
+# 2. ФИНАНСЫ: ПОШАГОВЫЙ ВВОД (FSM)
 # ==========================================
-@dp.message(ModeStates.waiting_for_name)
+@dp.message(ModeStates.waiting_for_name, F.text & ~F.text.startswith("/"))
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(new_name=message.text.strip())
     await message.answer("Укажите текущий наличный баланс (числом):")
     await state.set_state(ModeStates.waiting_for_balance)
 
-@dp.message(ModeStates.waiting_for_balance)
+@dp.message(ModeStates.waiting_for_balance, F.text & ~F.text.startswith("/"))
 async def process_balance(message: Message, state: FSMContext):
     try:
         bal = float(message.text.replace(",", "."))
         await state.update_data(new_balance=bal)
         await message.answer("Укажите план расходов на месяц (бюджет):")
         await state.set_state(ModeStates.waiting_for_budget)
-    except:
-        await message.answer("Пожалуйста, введите число.")
+    except ValueError:
+        await message.answer("Пожалуйста, введите число (например, 10000).")
 
-@dp.message(ModeStates.waiting_for_budget)
+@dp.message(ModeStates.waiting_for_budget, F.text & ~F.text.startswith("/"))
 async def process_budget(message: Message, state: FSMContext):
     try:
         budget = float(message.text.replace(",", "."))
         data = await state.get_data()
         user_id = message.from_user.id
         
-        # Используем upsert или безопасную вставку
+        name = data.get("new_name", "Основной")
+        balance = data.get("new_balance", 0.0)
+        
         res = supabase.table("users").insert({
             "telegram_id": user_id,
-            "name": data.get("new_name", "Основной"),
-            "balance": data.get("new_balance", 0.0),
+            "name": name,
+            "balance": balance,
             "monthly_budget": budget
         }).execute()
         
@@ -196,34 +198,15 @@ async def process_budget(message: Message, state: FSMContext):
             profile_id = res.data[0]["id"]
             await state.update_data(profile_id=profile_id)
             await state.set_state(ModeStates.finance_menu)
-            await message.answer(f"🎉 Профиль «{data['new_name']}» успешно создан!", reply_markup=get_finance_keyboard())
+            await message.answer(f"🎉 Профиль «{name}» успешно создан!", reply_markup=get_finance_keyboard())
         else:
-            raise Exception("База данных не вернула ID профиля")
-            
+            await message.answer("Не удалось создать профиль в базе данных.")
+    except ValueError:
+        await message.answer("Пожалуйста, введите число бюджетов (например, 8000).")
     except Exception as e:
-        logging.error(f"Ошибка создания профиля: {e}")
-        # Если возникла ошибка дублирования, пробуем обновить существующую запись
-        try:
-            user_id = message.from_user.id
-            data = await state.get_data()
-            budget = float(message.text.replace(",", "."))
-            
-            res = supabase.table("users").update({
-                "name": data.get("new_name", "Основной"),
-                "balance": data.get("new_balance", 0.0),
-                "monthly_budget": budget
-            }).eq("telegram_id", user_id).execute()
-            
-            if res.data:
-                profile_id = res.data[0]["id"]
-                await state.update_data(profile_id=profile_id)
-                await state.set_state(ModeStates.finance_menu)
-                await message.answer(f"🎉 Профиль «{data['new_name']}» успешно обновлен!", reply_markup=get_finance_keyboard())
-            else:
-                await message.answer("Ошибка при создании профиля. Попробуйте еще раз с /start")
-        except Exception as err:
-            logging.error(f"Финальная ошибка: {err}")
-            await message.answer("Не удалось сохранить профиль в Supabase.")
+        logging.error(f"Ошибка БД при создании профиля: {e}")
+        await message.answer("Произошла ошибка при сохранении профиля. Попробуйте снова ввести имя по команде /finance")
+        await state.clear()
 
 @dp.message(ModeStates.finance_menu, F.text == "👤 Управление профилями")
 async def manage_profiles(message: Message, state: FSMContext):
@@ -233,8 +216,8 @@ async def manage_profiles(message: Message, state: FSMContext):
     text = "📂 Ваши профили:\n\n"
     buttons = []
     for p in res.data:
-        text += f"• {p['name']} (Баланс: {p['balance']} ₽)\n"
-        buttons.append([KeyboardButton(text=f"Выбрать: {p['name']}")])
+        text += f"• {p.get('name', 'Профиль')} (Баланс: {p.get('balance', 0)} ₽)\n"
+        buttons.append([KeyboardButton(text=f"Выбрать: {p.get('name')}")])
         
     buttons.append([KeyboardButton(text="➕ Добавить новый профиль")])
     buttons.append([KeyboardButton(text="🗑 Удалить текущий профиль")])
@@ -308,26 +291,24 @@ async def add_tx_prompt(message: Message, state: FSMContext):
     await message.answer("Отправьте текст или голосовое (например: «Обед 300» или «Зарплата 50000»):")
 
 # ==========================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ
+# 3. ПЕРЕВОД И ФИНАНСОВЫЕ ЗАПИСИ
 # ==========================================
 async def process_translation(text: str, message: Message):
     prompt = f"""
-    Ты — интеллектуальный переводчик.
+    Ты — профессиональный переводчик.
     Правила:
-    1. Если пользователь явно просит перевести на конкретный язык (например, "переведи на японский..."), переведи на этот язык.
-    2. Если текст на иностранном языке (любом, кроме русского) — переведи его НА РУССКИЙ ЯЗЫК по умолчанию.
-    3. Если текст на русском языке — переведи его НА АНГЛИЙСКИЙ ЯЗЫК по умолчанию.
+    1. Если пользователь явно попросил перевести на конкретный язык (например, "переведи на японский..."), переведи на этот язык.
+    2. Если текст на ЛЮБОМ иностранном языке (английский, немецкий, китайский и т.д.) — переведи его НА РУССКИЙ ЯЗЫК.
+    3. Если текст на русском языке — переведи его НА АНГЛИЙСКИЙ ЯЗЫК.
     
-    Верни ТОЛЬКО готовый перевод без вводных фраз и комментариев.
+    Верни ТОЛЬКО перевод без комментариев.
     
-    Текст для перевода:
-    {text}
+    Текст: {text}
     """
     try:
         translated = safe_llm_completion(prompt)
         await message.answer(f"🔀 Перевод:\n\n{translated}")
     except Exception as e:
-        logging.error(f"Ошибка перевода: {e}")
         await message.answer("Ошибка сервиса перевода.")
 
 async def process_transaction_text(text: str, message: Message, state: FSMContext):
@@ -355,7 +336,7 @@ async def process_transaction_text(text: str, message: Message, state: FSMContex
         await message.answer("Ошибка распознавания записи.")
 
 # ==========================================
-# 4. ТЕКСТ И ГОЛОС (ПО УМОЛЧАНИЮ И В РЕЖИМАХ)
+# 4. ОБРАБОТЧИКИ СООБЩЕНИЙ ПО УМОЛЧАНИЮ
 # ==========================================
 @dp.message(ModeStates.translator, F.text & ~F.text.startswith("/"))
 async def handle_translator_text(message: Message):
