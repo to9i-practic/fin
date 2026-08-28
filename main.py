@@ -18,6 +18,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 from google import genai
+from google.genai import types
 from groq import Groq
 
 # Логирование
@@ -357,65 +358,67 @@ async def add_tx_prompt(message: Message, state: FSMContext):
 @dp.message(ModeStates.waiting_for_tx, F.photo)
 @dp.message(ModeStates.finance_menu, F.photo)
 async def process_tx_photo(message: Message, state: FSMContext):
+    # ИСПРАВЛЕНО: убран пробел в state
     data = await state.get_data()
+    # ИСПРАВЛЕНО: убран пробел в ключе
     pid = data.get("profile_id")
     
     if not pid:
         await message.answer("⚠️ Сначала выберите профиль в меню «Финансовый контроль».")
         return
-
-    # Скачиваем изображение наивысшего качества
+        
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     local_filename = f"photo_{message.message_id}.jpg"
-    await bot.download_file(file_info.file_path, local_filename)
-
-    status_msg = await message.answer("🔍 Распознаю записи на фото...")
-
+    
     try:
-        if not gemini_client:
-            await status_msg.edit_text("⚠️ Ошибка: GEMINI_API_KEY не настроен для распознавания фото.")
-            return
-
-        # Загружаем фото в Gemini API
-        uploaded_file = gemini_client.files.upload(file=local_filename)
+        await bot.download_file(file_info.file_path, local_filename)
+        status_msg = await message.answer("🔍 Распознаю записи на фото...")
         
+        if not gemini_client:
+            await status_msg.edit_text("⚠️ Ошибка: GEMINI_API_KEY не настроен.")
+            return
+            
+        with open(local_filename, "rb") as f:
+            image_bytes = f.read()
+            
         prompt = (
-            "Проанализируй фото (это может быть чек, список покупок или рукописная запись на бумаге). "
-            "Найди все финансовые операции (расходы или доходы). "
-            "Верни ответ STRICTLY в формате JSON массива объектов без markdown разметки:\n"
+            "Проанализируй фото (чек, список покупок или рукописная запись). "
+            "Найди все финансовые операции. "
+            "Верни ответ СТРОГО в формате JSON массива объектов без markdown разметки:\n"
             '[{"amount": 500, "type": "expense", "category": "Еда", "raw_text": "Обед"}, ...]\n'
             "Если ничего не найдено, верни пустой массив []."
         )
-
+        
         response = gemini_client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=[uploaded_file, prompt]
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            ]
         )
-
+        
         raw = response.text.strip()
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
-
+            
         transactions = json.loads(raw)
-
         if not transactions:
             await status_msg.edit_text("❌ Не удалось распознать суммовые записи на фото.")
             return
-
-        # Записываем все найденные позиции в Supabase
+            
         total_change = 0.0
         summary_text = "✅ **Записано с фото:**\n"
-
+        
         for item in transactions:
             amt = float(item.get("amount", 0))
             tx_type = item.get("type", "expense")
             cat = item.get("category", "Разное")
             item_name = item.get("raw_text", "Покупка по фото")
-
+            
             if amt <= 0:
                 continue
-
+                
             supabase.table("transactions").insert({
                 "telegram_id": int(message.from_user.id),
                 "profile_id": pid,
@@ -424,32 +427,70 @@ async def process_tx_photo(message: Message, state: FSMContext):
                 "category": cat,
                 "raw_text": item_name
             }).execute()
-
+            
             if tx_type == "expense":
                 total_change -= amt
                 summary_text += f"• 🔴 {item_name}: {amt:.2f} ₽ ({cat})\n"
             else:
                 total_change += amt
                 summary_text += f"• 🟢 {item_name}: {amt:.2f} ₽ ({cat})\n"
-
-        # Обновляем текущий баланс пользователя
+                
         prof_res = supabase.table("users").select("balance").eq("id", pid).execute()
         if prof_res.data:
             current_bal = float(prof_res.data[0].get("balance", 0))
             supabase.table("users").update({"balance": current_bal + total_change}).eq("id", pid).execute()
-
+            
         await state.set_state(ModeStates.waiting_for_tx)
         await status_msg.edit_text(summary_text, parse_mode="Markdown")
-
+        
+    except json.JSONDecodeError:
+        await status_msg.edit_text("❌ Ошибка формата ответа ИИ. Попробуйте сделать фото более четким.")
     except Exception as e:
         logging.error(f"Ошибка парсинга фото: {e}")
-        await status_msg.edit_text(" Ошибка распознавания изображения. Попробуйте сделать более четкое фото.")
+        await status_msg.edit_text("⚠️ Ошибка распознавания изображения. Попробуйте еще раз.")
     finally:
         if os.path.exists(local_filename):
             os.remove(local_filename)
 
 
-# --- ОБРАБОТКА ТЕКСТА (НЕ СБРАСЫВАЕТ СОСТОЯНИЕ) ---
+@dp.message(F.voice)
+async def process_voice(message: Message, state: FSMContext):
+    # ИСПРАВЛЕНО: Используем стабильный Groq Whisper вместо сломанного Gemini upload
+    if not groq_client:
+        await message.answer("Распознавание речи временно недоступно.")
+        return
+        
+    file_id = message.voice.file_id
+    file_info = await bot.get_file(file_id)
+    local_filename = f"voice_{message.message_id}.ogg"
+    
+    try:
+        await bot.download_file(file_info.file_path, local_filename)
+        with open(local_filename, "rb") as f:
+            trans = groq_client.audio.transcriptions.create(
+                file=(local_filename, f.read()),
+                model="whisper-large-v3",
+                language="ru"
+            )
+        text = trans.text.strip()
+        
+        current_state = await state.get_state()
+        if current_state == ModeStates.waiting_for_tx:
+            # Передаем распознанный текст в существующий обработчик транзакций
+            msg_copy = type('obj', (object,), {'text': text, 'from_user': message.from_user, 'answer': message.answer})
+            await process_tx_text(msg_copy, state)
+        else:
+            reply = safe_llm_completion(f"Ответь пользователю на это сообщение: {text}")
+            await message.answer(f"🗣 «{text}»\n\n🤖 {reply}")
+            
+    except Exception as e:
+        logging.error(f"Ошибка Whisper: {e}")
+        await message.answer("Ошибка при обработке голосового сообщения.")
+    finally:
+        if os.path.exists(local_filename):
+            os.remove(local_filename)
+
+
 @dp.message(ModeStates.waiting_for_tx, F.text & ~F.text.startswith("/"))
 async def process_tx_text(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -498,53 +539,6 @@ async def process_tx_text(message: Message, state: FSMContext):
         logging.error(f"Ошибка обработки транзакции: {e}")
         await message.answer("Ошибка распознавания. Попробуйте ввести: «Название Сумма» (например, «Ужин 400»).")
             
-@dp.message(ModeStates.waiting_for_tx, F.text & ~F.text.startswith("/"))
-async def process_tx_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-    pid = data.get("profile_id")
-    text = message.text
-    
-    prompt = (
-        f'Разбери запись: "{text}". '
-        f'Ответь ТОЛЬКО JSON без markdown. Формат: {{"amount": 500, "type": "expense", "category": "Еда"}}'
-    )
-    
-    try:
-        raw = safe_llm_completion(prompt)
-        if "```" in raw:
-            raw = raw.split("```")[1].replace("json", "").strip()
-            
-        parsed = json.loads(raw)
-        amt = float(parsed["amount"])
-        tx_type = parsed.get("type", "expense")
-        cat = parsed.get("category", "Разное")
-        
-        supabase.table("transactions").insert({
-            "telegram_id": int(message.from_user.id),
-            "profile_id": pid,
-            "amount": amt,
-            "type": tx_type,
-            "category": cat,
-            "raw_text": text
-        }).execute()
-        
-        prof_res = supabase.table("users").select("balance").eq("id", pid).execute()
-        if prof_res.data:
-            current_bal = float(prof_res.data[0].get("balance", 0))
-            new_bal = current_bal - amt if tx_type == "expense" else current_bal + amt
-            supabase.table("users").update({"balance": new_bal}).eq("id", pid).execute()
-        
-        await message.answer(f"✅ Записано: {amt:.2f} ₽ ({cat})", reply_markup=get_finance_keyboard())
-        await state.set_state(ModeStates.waiting_for_tx)
-        await message.answer(
-        f"✅ Записано: {amt:.2f} ₽ ({cat})\n\n"
-        "Отправьте следующую запись или выберите действие в меню ниже:", 
-        reply_markup=get_finance_keyboard()
-        )
-    except Exception as e:
-        logging.error(f"Ошибка обработки транзакции: {e}")
-        await message.answer("Ошибка распознавания. Попробуйте ввести: «Название Сумма» (например, «Пиво 500»).")
-
 @dp.message(F.voice)
 async def process_voice(message: Message, state: FSMContext):
     file_id = message.voice.file_id
