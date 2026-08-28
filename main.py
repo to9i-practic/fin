@@ -50,12 +50,12 @@ if not gemini_client and not groq_client:
     logging.error("Не задан ни один API-ключ для ИИ (GEMINI_API_KEY или GROQ_API_KEY)!")
     sys.exit(1)
 
-# Стабильный каскад рабочих моделей
 CASCADE_MODELS = [
-    {"provider": "gemini", "name": "gemini-1.5-flash"},
     {"provider": "gemini", "name": "gemini-2.0-flash"},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
-    {"provider": "groq",   "name": "llama-3.1-8b-instant"}
+    {"provider": "gemini", "name": "gemini-1.5-flash"},
+    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
+    {"provider": "groq",   "name": "gemma2-9b-it"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
