@@ -60,7 +60,7 @@ CASCADE_MODELS = [
     {"provider": "gemini", "name": "gemini-2.0-flash", "supports_image": True},
     {"provider": "gemini", "name": "gemini-1.5-flash", "supports_image": True},
     {"provider": "groq", "name": "openai/gpt-oss-120b", "supports_image": False},
-    {"provider": "groq", "name": "qwen/qwen3.6-27b", "supports_image": False}
+    {"provider": "groq", "name": "qwen/qwen3.6-27b", "supports_image": False},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile", "supports_image": False},
     {"provider": "groq",   "name": "llama-3.1-8b-instant", "supports_image": False}
 ]
