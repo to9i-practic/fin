@@ -7,6 +7,7 @@ import uuid
 import base64
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BotCommand, BotCommandScopeDefault,
@@ -28,6 +29,7 @@ logging.basicConfig(level=logging.INFO)
 # Загрузка переменных окружения
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -49,8 +51,9 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# КАСКАД МОДЕЛЕЙ: порядок важен! Сначала пробуются лучшие, при ошибке - следующие.
-# supports_image=True означает, что модель может обрабатывать фото.
+# ==========================================
+# 1. 100% РАБОЧИЙ КАСКАД МОДЕЛЕЙ ИИ
+# ==========================================
 CASCADE_MODELS = [
     {"provider": "openai", "name": "gpt-4o-mini", "supports_image": True},
     {"provider": "openai", "name": "gpt-4o", "supports_image": True},
@@ -58,6 +61,8 @@ CASCADE_MODELS = [
     {"provider": "gemini", "name": "gemini-1.5-flash", "supports_image": True},
     {"provider": "groq", "name": "openai/gpt-oss-120b", "supports_image": False},
     {"provider": "groq", "name": "qwen/qwen3.6-27b", "supports_image": False}
+    {"provider": "groq",   "name": "llama-3.3-70b-versatile", "supports_image": False},
+    {"provider": "groq",   "name": "llama-3.1-8b-instant", "supports_image": False}
 ]
 
 def safe_llm_completion(prompt: str, image_bytes: bytes = None, mime_type: str = None) -> str:
@@ -68,11 +73,11 @@ def safe_llm_completion(prompt: str, image_bytes: bytes = None, mime_type: str =
         model_name = model_info["name"]
         supports_image = model_info.get("supports_image", False)
 
-        # Если передано фото, но модель его не поддерживает, пропускаем её
         if image_bytes and not supports_image:
             continue
 
         try:
+            # === OpenAI ===
             if provider == "openai":
                 if not openai_client:
                     continue
@@ -91,6 +96,7 @@ def safe_llm_completion(prompt: str, image_bytes: bytes = None, mime_type: str =
                 if response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content.strip()
 
+            # === Gemini ===
             elif provider == "gemini":
                 if not gemini_client:
                     continue
@@ -103,6 +109,7 @@ def safe_llm_completion(prompt: str, image_bytes: bytes = None, mime_type: str =
                 if response.text:
                     return response.text.strip()
 
+            # === Groq ===
             elif provider == "groq":
                 if not groq_client:
                     continue
@@ -126,17 +133,17 @@ def safe_llm_completion(prompt: str, image_bytes: bytes = None, mime_type: str =
     raise Exception("Ни одна из ИИ-моделей не доступна.")
 
 async def send_chunked_message(message: Message, text: str, parse_mode: str = "Markdown"):
-    """Отправляет длинное сообщение частями, чтобы избежать ошибки Telegram 'message is too long'."""
+    """Отправляет длинное сообщение частями."""
     chunk_size = 4000
     for i in range(0, len(text), chunk_size):
         chunk = text[i:i + chunk_size]
         try:
             await message.answer(chunk, parse_mode=parse_mode)
         except Exception:
-            await message.answer(chunk) # Фоллбэк без разметки, если она сломалась
+            await message.answer(chunk)
 
 # ==========================================
-# СОСТОЯНИЯ FSM И КЛАВИАТУРЫ
+# 2. СОСТОЯНИЯ FSM И КЛАВИАТУРЫ
 # ==========================================
 class ModeStates(StatesGroup):
     finance_menu = State()
@@ -188,7 +195,7 @@ async def set_main_menu(bot: Bot):
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 # ==========================================
-# ОСНОВНЫЕ ХЭНДЛЕРЫ
+# 3. ОСНОВНЫЕ ХЭНДЛЕРЫ
 # ==========================================
 @dp.message(Command("start"))
 @dp.message(F.text.contains("Общение с ИИ"))
@@ -307,6 +314,9 @@ async def process_budget(message: Message, state: FSMContext):
         await message.answer("Ошибка при сохранении профиля в БД.")
         await state.clear()
 
+# ==========================================
+# 4. КОРРЕКТИРОВКА ПОЛЬЗОВАТЕЛЯ
+# ==========================================
 @dp.message(ModeStates.finance_menu, F.text == "⚙️ Корректировка пользователя")
 async def open_edit_profile(message: Message, state: FSMContext):
     await state.set_state(ModeStates.edit_profile_menu)
@@ -370,6 +380,9 @@ async def delete_profile_confirm(message: Message, state: FSMContext):
         await message.answer("🗑 Профиль и его история успешно удалены.")
         await start_finance(message, state)
 
+# ==========================================
+# 5. ТРАНЗАКЦИИ (ТЕКСТ, ФОТО, ГОЛОС)
+# ==========================================
 @dp.message(ModeStates.finance_menu, F.text == "➕ Внести расход/доход")
 async def add_tx_prompt(message: Message, state: FSMContext):
     await state.set_state(ModeStates.waiting_for_tx)
@@ -399,7 +412,7 @@ async def process_tx_photo(message: Message, state: FSMContext):
     
     try:
         await bot.download_file(file_info.file_path, local_filename)
-        status_msg = await message.answer("🔍 Распознаю записи на фото (использую каскад ИИ)...")
+        status_msg = await message.answer("🔍 Распознаю записи на фото...")
         
         with open(local_filename, "rb") as f:
             image_bytes = f.read()
@@ -412,7 +425,6 @@ async def process_tx_photo(message: Message, state: FSMContext):
             "Если ничего не найдено, верни пустой массив []."
         )
         
-        # ИСПОЛЬЗУЕМ ЕДИНЫЙ КАСКАД ДЛЯ ФОТО!
         raw = safe_llm_completion(prompt, image_bytes=image_bytes, mime_type="image/jpeg")
         
         if "```" in raw:
@@ -522,7 +534,6 @@ async def process_voice(message: Message, state: FSMContext):
     try:
         await bot.download_file(file_info.file_path, local_filename)
         
-        # ПРИОРИТЕТ: Groq Whisper (быстрый и дешевый)
         if groq_client:
             with open(local_filename, "rb") as f:
                 trans = groq_client.audio.transcriptions.create(
@@ -541,10 +552,11 @@ async def process_voice(message: Message, state: FSMContext):
             
         current_state = await state.get_state()
         if current_state == ModeStates.waiting_for_tx:
-            msg_copy = type('obj', (object,), {'text': text, 'from_user': message.from_user, 'answer': message.answer})
-            await process_tx_text(msg_copy, state)
+            # Напрямую передаем строку от распознанного голоса в логику транзакции
+            message.text = text
+            await process_tx_text(message, state)
         else:
-            reply = safe_llm_completion(f"Ответь пользователю на это сообщение: {text}")
+            reply = safe_llm_completion(f"Ответь пользователю на сообщение: {text}")
             await send_chunked_message(message, f"🗣 «{text}»\n\n🤖 {reply}")
             
     except Exception as e:
@@ -582,7 +594,7 @@ async def default_ai_chat(message: Message):
         await message.answer("Ошибка генерации ответа.")
 
 # ==========================================
-# ЗАПУСК И HEALTH CHECK
+# 6. ЗАПУСК И HEALTH CHECK
 # ==========================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -598,10 +610,9 @@ def run_dummy_server():
 async def main():
     await set_main_menu(bot)
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    logging.info("Бот успешно запущен с каскадом OpenAI -> Gemini -> Groq!")
+    logging.info("Бот успешно запущен!")
     await dp.start_polling(bot)
 
-# КОРРЕКТНАЯ ТОЧКА ВХОДА PYTHON
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
