@@ -53,28 +53,34 @@ if not gemini_client and not groq_client:
 CASCADE_MODELS = [
     {"provider": "gemini", "name": "gemini-2.0-flash"},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
+    {"provider": "groq",   "name": "qwen/qwen3-32b"},
     {"provider": "gemini", "name": "gemini-1.5-flash"},
-    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
-    {"provider": "groq",   "name": "gemma2-9b-it"}
+    {"provider": "groq",   "name": "meta-llama/llama-4-scout-17b-16e-instruct"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
+    errors = []
+    
     for model_info in CASCADE_MODELS:
         provider = model_info["provider"]
         model_name = model_info["name"]
+        
         try:
-            # Блок работы с Groq
-            if provider == "groq" and groq_client:
+            if provider == "groq":
+                if not groq_client:
+                    continue
                 response = groq_client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2
+                    temperature=0.3,
+                    timeout=8
                 )
                 if response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content.strip()
 
-            # Блок работы с Gemini
-            elif provider == "gemini" and gemini_client:
+            elif provider == "gemini":
+                if not gemini_client:
+                    continue
                 response = gemini_client.models.generate_content(
                     model=model_name, 
                     contents=prompt
@@ -83,10 +89,13 @@ def safe_llm_completion(prompt: str) -> str:
                     return response.text.strip()
 
         except Exception as e:
-            logging.warning(f"Ошибка модели [{provider}:{model_name}] -> {e}")
+            err_details = f"[{provider}:{model_name}] Ошибка -> {e}"
+            logging.warning(f"Каскад: модель не ответила. {err_details}")
+            errors.append(err_details)
             continue
 
-    raise Exception("Ни одна из ИИ-моделей не ответила.")
+    logging.error(f"❌ Все модели в каскаде вышли из строя: {errors}")
+    raise Exception("Ни одна из ИИ-моделей не доступна.")
 
 async def process_transaction_text(text: str, message: Message, state: FSMContext):
     data = await state.get_data()
