@@ -51,10 +51,10 @@ if not gemini_client and not groq_client:
     sys.exit(1)
 
 CASCADE_MODELS = [
-    {"provider": "gemini", "name": "gemini-2.0-flash"},
-    {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
-    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
-    {"provider": "groq",   "name": "gemma2-9b-it"},
+    {"provider": "groq", "name": "openai/gpt-oss-20b"},
+    {"provider": "groq", "name": "openai/gpt-oss-120b"},
+    {"provider": "groq", "name": "qwen/qwen3.6-27b"},
+    {"provider": "gemini", "name": "gemini-2.0-flash"}, 
     {"provider": "gemini", "name": "gemini-1.5-flash"}
 ]
 
