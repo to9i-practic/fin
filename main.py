@@ -53,9 +53,9 @@ if not gemini_client and not groq_client:
 CASCADE_MODELS = [
     {"provider": "gemini", "name": "gemini-2.0-flash"},
     {"provider": "groq",   "name": "llama-3.3-70b-versatile"},
-    {"provider": "groq",   "name": "qwen/qwen3-32b"},
-    {"provider": "gemini", "name": "gemini-1.5-flash"},
-    {"provider": "groq",   "name": "meta-llama/llama-4-scout-17b-16e-instruct"}
+    {"provider": "groq",   "name": "llama-3.1-8b-instant"},
+    {"provider": "groq",   "name": "gemma2-9b-it"},
+    {"provider": "gemini", "name": "gemini-1.5-flash"}
 ]
 
 def safe_llm_completion(prompt: str) -> str:
@@ -66,8 +66,22 @@ def safe_llm_completion(prompt: str) -> str:
         model_name = model_info["name"]
         
         try:
-            if provider == "groq":
+            # === Вызов Gemini ===
+            if provider == "gemini":
+                if not gemini_client:
+                    errors.append(f"[{provider}:{model_name}] Пропущен -> GEMINI_API_KEY не задан")
+                    continue
+                response = gemini_client.models.generate_content(
+                    model=model_name, 
+                    contents=prompt
+                )
+                if response.text:
+                    return response.text.strip()
+
+            # === Вызов Groq ===
+            elif provider == "groq":
                 if not groq_client:
+                    errors.append(f"[{provider}:{model_name}] Пропущен -> GROQ_API_KEY не задан")
                     continue
                 response = groq_client.chat.completions.create(
                     model=model_name,
@@ -78,19 +92,9 @@ def safe_llm_completion(prompt: str) -> str:
                 if response.choices and response.choices[0].message.content:
                     return response.choices[0].message.content.strip()
 
-            elif provider == "gemini":
-                if not gemini_client:
-                    continue
-                response = gemini_client.models.generate_content(
-                    model=model_name, 
-                    contents=prompt
-                )
-                if response.text:
-                    return response.text.strip()
-
         except Exception as e:
             err_details = f"[{provider}:{model_name}] Ошибка -> {e}"
-            logging.warning(f"Каскад: модель не ответила. {err_details}")
+            logging.warning(f"Каскад: {err_details}")
             errors.append(err_details)
             continue
 
