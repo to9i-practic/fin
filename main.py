@@ -5,6 +5,10 @@ import logging
 import threading
 import uuid
 import base64
+import easyocr
+import cv2
+import numpy as np
+
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -396,6 +400,14 @@ async def add_tx_prompt(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+import easyocr
+import cv2
+import numpy as np
+
+# Инициализация EasyOCR reader (загружает модели при первом запуске)
+# 'ru' - русский, 'en' - английский. Можно добавить другие языки при необходимости.
+ocr_reader = easyocr.Reader(['ru', 'en'], gpu=False)
+
 @dp.message(ModeStates.waiting_for_tx, F.photo)
 @dp.message(ModeStates.finance_menu, F.photo)
 async def process_tx_photo(message: Message, state: FSMContext):
@@ -412,29 +424,50 @@ async def process_tx_photo(message: Message, state: FSMContext):
     
     try:
         await bot.download_file(file_info.file_path, local_filename)
-        status_msg = await message.answer("🔍 Распознаю записи на фото...")
+        status_msg = await message.answer("🔍 Распознаю текст на фото (OCR)...")
         
-        with open(local_filename, "rb") as f:
-            image_bytes = f.read()
+        # === ШАГ 1: OCR без ИИ (EasyOCR) ===
+        # Читаем изображение с помощью OpenCV
+        img = cv2.imread(local_filename)
+        
+        # Используем EasyOCR для извлечения текста
+        # detail=0 возвращает только текст без координат bounding box
+        ocr_results = ocr_reader.readtext(img, detail=0, paragraph=True)
+        
+        # Объединяем все распознанные строки в один текст
+        extracted_text = "\n".join(ocr_results).strip()
+        
+        if not extracted_text:
+            await status_msg.edit_text("❌ Не удалось распознать текст на фото. Попробуйте сделать более четкое изображение.")
+            return
             
+        await status_msg.edit_text(f"📝 Распознано {len(extracted_text)} символов. Анализирую финансовые операции...")
+        
+        # === ШАГ 2: Передача текста в LLM для структурирования ===
         prompt = (
-            "Проанализируй фото (чек, список покупок или рукописная запись). "
-            "Найди все финансовые операции. "
-            "Верни ответ СТРОГО в формате JSON массива объектов без markdown разметки:\n"
-            '[{"amount": 500, "type": "expense", "category": "Еда", "raw_text": "Обед"}, ...]\n'
-            "Если ничего не найдено, верни пустой массив []."
+            f"Проанализируй следующий текст, распознанный с фото (чек, список покупок или рукописная запись):\n\n"
+            f"---\n{extracted_text}\n---\n\n"
+            f"Найди все финансовые операции (расходы или доходы). "
+            f"Верни ответ СТРОГО в формате JSON массива объектов без markdown разметки:\n"
+            f'[{{"amount": 500, "type": "expense", "category": "Еда", "raw_text": "Обед"}}, ...]\n'
+            f"Если ничего не найдено, верни пустой массив [].\n"
+            f"Категории могут быть: Еда, Транспорт, Развлечения, Одежда, Здоровье, Коммунальные услуги, Зарплата, Другое."
         )
         
-        raw = safe_llm_completion(prompt, image_bytes=image_bytes, mime_type="image/jpeg")
+        # Используем единый каскад LLM для анализа текста
+        raw = safe_llm_completion(prompt)
         
+        # Очистка ответа от возможных markdown-оберток
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
             
         transactions = json.loads(raw)
+        
         if not transactions:
-            await status_msg.edit_text("❌ Не удалось распознать суммовые записи на фото.")
+            await status_msg.edit_text("❌ Не удалось найти финансовые операции в распознанном тексте.")
             return
             
+        # === ШАГ 3: Сохранение транзакций в БД ===
         total_change = 0.0
         summary_text = "✅ **Записано с фото:**\n"
         
@@ -463,6 +496,7 @@ async def process_tx_photo(message: Message, state: FSMContext):
                 total_change += amt
                 summary_text += f"• 🟢 {item_name}: {amt:.2f} ₽ ({cat})\n"
                 
+        # Обновляем баланс пользователя
         prof_res = supabase.table("users").select("balance").eq("id", pid).execute()
         if prof_res.data:
             current_bal = float(prof_res.data[0].get("balance", 0))
@@ -474,9 +508,10 @@ async def process_tx_photo(message: Message, state: FSMContext):
     except json.JSONDecodeError:
         await status_msg.edit_text("❌ Ошибка формата ответа ИИ. Попробуйте сделать фото более четким.")
     except Exception as e:
-        logging.error(f"Ошибка парсинга фото: {e}")
+        logging.error(f"Ошибка обработки фото: {e}")
         await status_msg.edit_text("⚠️ Ошибка распознавания изображения. Попробуйте еще раз.")
     finally:
+        # Гарантированная очистка временного файла
         if os.path.exists(local_filename):
             os.remove(local_filename)
 
